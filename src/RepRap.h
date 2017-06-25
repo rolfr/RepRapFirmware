@@ -80,6 +80,10 @@ public:
 	Scanner& GetScanner() const;
 	PrintMonitor& GetPrintMonitor() const;
 
+#if SUPPORT_IOBITS
+ 	PortControl& GetPortControl() const;
+#endif
+
 	void Tick();
 	uint16_t GetTicksInSpinState() const;
 	bool IsStopped() const;
@@ -95,6 +99,8 @@ public:
 
 	void Beep(int freq, int ms);
 	void SetMessage(const char *msg);
+	void SetAlert(const char *msg, const char *title, int mode, float timeout, bool showZControls);
+	void ClearAlert();
 
 	static void CopyParameterText(const char* src, char *dst, size_t length);
 	static uint32_t DoDivide(uint32_t a, uint32_t b);		// helper function for diagnostic tests
@@ -113,6 +119,10 @@ private:
 	Roland* roland;
 	Scanner* scanner;
  	PrintMonitor* printMonitor;
+
+#if SUPPORT_IOBITS
+ 	PortControl *portControl;
+#endif
 
 	Tool* toolList;
 	Tool* currentTool;
@@ -137,6 +147,12 @@ private:
 
 	int beepFrequency, beepDuration;
 	char message[MESSAGE_LENGTH + 1];
+
+	bool displayMessageBox;
+	char boxMessage[MESSAGE_LENGTH + 1], boxTitle[MESSAGE_LENGTH + 1];
+	int boxMode;
+	uint32_t boxTimer, boxTimeout;
+	bool boxZControls;
 };
 
 inline Platform& RepRap::GetPlatform() const { return *platform; }
@@ -147,6 +163,10 @@ inline Network& RepRap::GetNetwork() const { return *network; }
 inline Roland& RepRap::GetRoland() const { return *roland; }
 inline Scanner& RepRap::GetScanner() const { return *scanner; }
 inline PrintMonitor& RepRap::GetPrintMonitor() const { return *printMonitor; }
+
+#if SUPPORT_IOBITS
+inline PortControl& RepRap::GetPortControl() const { return *portControl; }
+#endif
 
 inline bool RepRap::Debug(Module m) const { return debug & (1 << m); }
 inline Module RepRap::GetSpinningModule() const { return spinningModule; }
