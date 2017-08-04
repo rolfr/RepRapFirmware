@@ -31,7 +31,13 @@ public:
 	void Check();
 	void Disable();
 
+#ifdef DUET_NG
+	bool WriteSettings(FileStore *f, size_t fanNum) const;		// Save the settings of this fan if it isn't thermostatic
+#endif
+
 private:
+	typedef uint32_t HeatersMonitoredBitmap;				// needs to be wide enough for 8 real heaters + 10 virtual heaters
+
 	float val;
 	float lastVal;
 	float minVal;
@@ -39,8 +45,8 @@ private:
 	float lastPwm;
 	uint32_t blipTime;						// in milliseconds
 	uint32_t blipStartTime;
+	HeatersMonitoredBitmap heatersMonitored;
 	uint16_t freq;
-	uint16_t heatersMonitored;
 	Pin pin;
 	bool inverted;
 	bool hardwareInverted;

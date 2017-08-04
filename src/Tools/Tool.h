@@ -28,46 +28,49 @@ Licence: GPL
 
 #include "RepRapFirmware.h"
 
-const size_t ToolNameLength = 32;				// maximum allowed length for tool names
-const uint32_t DefaultXAxisMapping = 0x0001;	// by default, X is mapped to X
+const size_t ToolNameLength = 32;						// maximum allowed length for tool names
+const AxesBitmap DefaultXAxisMapping = 1u << X_AXIS;	// by default, X is mapped to X
+const AxesBitmap DefaultYAxisMapping = 1u << Y_AXIS;	// by default, Y is mapped to Y
 
 class Filament;
 class Tool
 {
 public:
 
-	static Tool *Create(int toolNumber, const char *name, long d[], size_t dCount, long h[], size_t hCount, uint32_t xMap, uint32_t fanMap);
+	static Tool *Create(int toolNumber, const char *name, long d[], size_t dCount, long h[], size_t hCount, AxesBitmap xMap, AxesBitmap yMap, FansBitmap fanMap, StringRef& reply);
 	static void Delete(Tool *t);
 
 	const float *GetOffset() const;
 	void SetOffset(const float offs[MaxAxes]);
 	size_t DriveCount() const;
-	int Drive(int driveNumber) const;
+	int Drive(size_t driveNumber) const;
 	bool ToolCanDrive(bool extrude);
 	size_t HeaterCount() const;
-	int Heater(int heaterNumber) const;
+	int Heater(size_t heaterNumber) const;
 	const char *GetName() const;
 	int Number() const;
 	void SetVariables(const float* standby, const float* active);
 	void GetVariables(float* standby, float* active) const;
 	void DefineMix(const float m[]);
 	const float* GetMix() const;
-	void SetMixing(bool b);
-	bool GetMixing() const;
 	float MaxFeedrate() const;
 	float InstantDv() const;
 	void Print(StringRef& reply);
-	uint32_t GetXAxisMap() const { return xMapping; }
-	uint32_t GetFanMapping() const { return fanMapping; }
+	AxesBitmap GetXAxisMap() const { return xMapping; }
+	AxesBitmap GetYAxisMap() const { return yMapping; }
+	FansBitmap GetFanMapping() const { return fanMapping; }
 	Filament *GetFilament() const { return filament; }
+	Tool *Next() const { return next; }
+
+#ifdef DUET_NG
+	bool WriteSettings(FileStore *f) const;			// write the tool's settings to file
+#endif
 
 	float virtualExtruderPosition;
 
 	friend class RepRap;
 
 protected:
-
-	Tool* Next() const;
 	void Activate(Tool* currentlyActive);
 	void Standby();
 	void FlagTemperatureFault(int8_t dudHeater);
@@ -92,18 +95,24 @@ private:
 	float standbyTemperatures[Heaters];
 	size_t heaterCount;
 	float offset[MaxAxes];
-	uint32_t xMapping;
-	uint32_t fanMapping;
+	AxesBitmap xMapping, yMapping;
+	FansBitmap fanMapping;
 	Filament *filament;
 	Tool* next;
 
-	bool mixing;
-	bool active;
+	enum class ToolState : uint8_t
+	{
+		off = 0,
+		active,
+		standby
+	};
+	ToolState state;
+
 	bool heaterFault;
 	volatile bool displayColdExtrudeWarning;
 };
 
-inline int Tool::Drive(int driveNumber) const
+inline int Tool::Drive(size_t driveNumber) const
 {
 	return drives[driveNumber];
 }
@@ -113,14 +122,9 @@ inline size_t Tool::HeaterCount() const
 	return heaterCount;
 }
 
-inline int Tool::Heater(int heaterNumber) const
+inline int Tool::Heater(size_t heaterNumber) const
 {
 	return heaters[heaterNumber];
-}
-
-inline Tool* Tool::Next() const
-{
-	return next;
 }
 
 inline const char *Tool::GetName() const
@@ -136,16 +140,6 @@ inline int Tool::Number() const
 inline const float* Tool::GetMix() const
 {
 	return mix;
-}
-
-inline void Tool::SetMixing(bool b)
-{
-	mixing = b;
-}
-
-inline bool Tool::GetMixing() const
-{
-	return mixing;
 }
 
 inline size_t Tool::DriveCount() const

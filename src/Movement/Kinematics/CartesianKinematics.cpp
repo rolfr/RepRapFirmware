@@ -6,8 +6,9 @@
  */
 
 #include "CartesianKinematics.h"
+#include "Movement/DDA.h"
 
-CartesianKinematics::CartesianKinematics() : Kinematics(KinematicsType::cartesian)
+CartesianKinematics::CartesianKinematics() : ZLeadscrewKinematics(KinematicsType::cartesian)
 {
 }
 
@@ -22,7 +23,7 @@ bool CartesianKinematics::CartesianToMotorSteps(const float machinePos[], const 
 {
 	for (size_t axis = 0; axis < numVisibleAxes; ++axis)
 	{
-		motorPos[axis] = (int32_t)roundf(machinePos[axis] * stepsPerMm[axis]);
+		motorPos[axis] = lrintf(machinePos[axis] * stepsPerMm[axis]);
 	}
 	return true;
 }
@@ -35,6 +36,16 @@ void CartesianKinematics::MotorStepsToCartesian(const int32_t motorPos[], const 
 	{
 		machinePos[drive] = motorPos[drive]/stepsPerMm[drive];
 	}
+}
+
+// This function is called from the step ISR when an endstop switch is triggered during homing.
+// Take the action needed to define the current position, normally by calling dda.SetDriveCoordinate() or dda.SetPositions().
+// Return true if the entire move should be stopped, false if only the motor concerned should be stopped.
+bool CartesianKinematics::OnHomingSwitchTriggered(size_t axis, bool highEnd, const float stepsPerMm[], DDA& dda) const
+{
+	const float hitPoint = (highEnd) ? reprap.GetPlatform().AxisMaximum(axis) : reprap.GetPlatform().AxisMinimum(axis);
+	dda.SetDriveCoordinate(hitPoint * stepsPerMm[axis], axis);
+	return false;
 }
 
 // End

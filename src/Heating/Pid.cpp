@@ -47,7 +47,7 @@ void PID::Init(float pGain, float pTc, float pTd, float tempLimit, bool usePid)
 	temperatureLimit = tempLimit;
 	maxTempExcursion = DefaultMaxTempExcursion;
 	maxHeatingFaultTime = DefaultMaxHeatingFaultTime;
-	model.SetParameters(pGain, pTc, pTd, 1.0, usePid);
+	model.SetParameters(pGain, pTc, pTd, 1.0, tempLimit, usePid);
 	Reset();
 
 	if (model.IsEnabled())
@@ -74,12 +74,16 @@ void PID::Reset()
 	averagePWM = lastPwm = 0.0;
 	heatingFaultCount = 0;
 	temperature = BAD_ERROR_TEMPERATURE;
+#ifdef DUET_NG
+	suspended = false;
+#endif
 }
 
 // Set the process model
 bool PID::SetModel(float gain, float tc, float td, float maxPwm, bool usePid)
 {
-	const bool rslt = model.SetParameters(gain, tc, td, maxPwm, usePid);
+	const float temperatureLimit = reprap.GetHeat().GetTemperatureLimit(heater);
+	const bool rslt = model.SetParameters(gain, tc, td, maxPwm, temperatureLimit, usePid);
 	if (rslt)
 	{
 #if !defined(DUET_NG) && !defined(__RADDS__) && !defined(__ALLIGATOR__)
@@ -91,13 +95,13 @@ bool PID::SetModel(float gain, float tc, float td, float maxPwm, bool usePid)
 #endif
 		if (model.IsEnabled())
 		{
-			const float safeGain = (heater == reprap.GetHeat().GetBedHeater() || heater == reprap.GetHeat().GetChamberHeater())
-									? 170.0 : 480.0;
-			if (gain > safeGain)
+			const float predictedMaxTemp = gain + NormalAmbientTemperature;
+			const float noWarnTemp = (temperatureLimit - NormalAmbientTemperature) * 1.5 + 50.0;		// allow 50% extra power plus enough for an extra 50C
+			if (predictedMaxTemp > noWarnTemp)
 			{
 				platform.MessageF(GENERIC_MESSAGE,
-						"Warning: Heater %u appears to be over-powered. If left on at full power, its temperature is predicted to reach %uC.\n",
-						heater, (unsigned int)gain + 20);
+						"Warning: Heater %u appears to be over-powered. If left on at full power, its temperature is predicted to reach %dC.\n",
+						heater, (int)predictedMaxTemp);
 			}
 		}
 		else
@@ -123,31 +127,34 @@ TemperatureError PID::ReadTemperature()
 // This must be called whenever the heater is turned on, and any time the heater is active and the target temperature is changed
 void PID::SwitchOn()
 {
-	if (mode == HeaterMode::fault)
+	if (model.IsEnabled())
 	{
-		if (reprap.Debug(Module::moduleHeat))
+		if (mode == HeaterMode::fault)
 		{
-			platform.MessageF(GENERIC_MESSAGE, "Heater %d not switched on due to temperature fault\n", heater);
-		}
-	}
-	else if (model.IsEnabled())
-	{
-//debugPrintf("Heater %d on temp %.1f\n", heater, temperature);
-		const float target = (active) ? activeTemperature : standbyTemperature;
-		const HeaterMode oldMode = mode;
-		mode = (temperature + TEMPERATURE_CLOSE_ENOUGH < target) ? HeaterMode::heating
-				: (temperature > target + TEMPERATURE_CLOSE_ENOUGH) ? HeaterMode::cooling
-					: HeaterMode::stable;
-		if (mode != oldMode)
-		{
-			heatingFaultCount = 0;
-			if (mode == HeaterMode::heating)
+			if (reprap.Debug(Module::moduleHeat))
 			{
-				timeSetHeating = millis();
+				platform.MessageF(GENERIC_MESSAGE, "Heater %d not switched on due to temperature fault\n", heater);
 			}
-			if (reprap.Debug(Module::moduleHeat) && oldMode == HeaterMode::off)
+		}
+		else if (model.IsEnabled())
+		{
+			//debugPrintf("Heater %d on, temp %.1f\n", heater, temperature);
+			const float target = (active) ? activeTemperature : standbyTemperature;
+			const HeaterMode oldMode = mode;
+			mode = (temperature + TEMPERATURE_CLOSE_ENOUGH < target) ? HeaterMode::heating
+					: (temperature > target + TEMPERATURE_CLOSE_ENOUGH) ? HeaterMode::cooling
+						: HeaterMode::stable;
+			if (mode != oldMode)
 			{
-				platform.MessageF(GENERIC_MESSAGE, "Heater %d switched on\n", heater);
+				heatingFaultCount = 0;
+				if (mode == HeaterMode::heating)
+				{
+					timeSetHeating = millis();
+				}
+				if (reprap.Debug(Module::moduleHeat) && oldMode == HeaterMode::off)
+				{
+					platform.MessageF(GENERIC_MESSAGE, "Heater %d switched on\n", heater);
+				}
 			}
 		}
 	}
@@ -181,6 +188,13 @@ void PID::Spin()
 {
 	if (model.IsEnabled())
 	{
+#ifdef DUET_NG
+		if (suspended)
+		{
+			SetHeater(0.0);
+			return;
+		}
+#endif
 		// Read the temperature
 		const TemperatureError err = ReadTemperature();
 
@@ -653,7 +667,7 @@ void PID::DoTuningStep()
 			const int peakIndex = GetPeakTempIndex();
 			if (peakIndex < 0)
 			{
-				if (millis() - tuningPhaseStartTime < 120 * 1000)			// allow 2 minutes for the bed temperature to start falling
+				if (millis() - tuningPhaseStartTime < 60 * 1000)			// allow 1 minute for the bed temperature reach peal temperature
 				{
 					return;			// still waiting for peak temperature
 				}
@@ -728,7 +742,8 @@ void PID::DoTuningStep()
 }
 
 // Calculate which reading gave us the peak temperature.
-// Return -1 if peak not identified yet, 0 if we failed to find a peak, else the index of the peak (which can't be zero because we always average 3 readings)
+// Return -1 if peak not identified yet, 0 if we are never going to find a peak, else the index of the peak
+// If the readings show a continuous decrease then we return 1, because zero dead time would lead to infinities
 /*static*/ int PID::GetPeakTempIndex()
 {
 	// Check we have enough readings to look for the peak
@@ -747,20 +762,25 @@ void PID::DoTuningStep()
 			peakIndex = IdentifyPeak(5);
 			if (peakIndex < 0)
 			{
-				return 0;					// more than one peak
+				peakIndex = IdentifyPeak(7);
+				if (peakIndex < 0)
+				{
+					return 0;					// more than one peak
+				}
 			}
 		}
 	}
 
 	// If we have found one peak and it's not too near the end of the readings, return it
-	return ((size_t)peakIndex + 6 < tuningReadingsTaken) ? peakIndex : -1;
+	return ((size_t)peakIndex + 3 < tuningReadingsTaken) ? max<int>(peakIndex, 1) : -1;
 }
 
 // See if there is exactly one peak in the readings.
-// Return -1 if more than one peak, else the index of the peak. The so-called peak may be right at the end , in which case it isn't really a peak.
+// Return -1 if more than one peak, else the index of the peak. The so-called peak may be right at the end, in which case it isn't really a peak.
+// With a well-insulated bed heater the temperature may not start dropping appreciably within the 120 second time limit allowed.
 /*static*/ int PID::IdentifyPeak(size_t numToAverage)
 {
-	int firstPeakIndex = -1;
+	int firstPeakIndex = -1, lastSameIndex = -1;
 	float peakTempTimesN = -999.0;
 	for (size_t i = 0; i + numToAverage <= tuningReadingsTaken; ++i)
 	{
@@ -769,17 +789,21 @@ void PID::DoTuningStep()
 		{
 			peak += tuningTempReadings[i + j];
 		}
-		if (peak >= peakTempTimesN)
+		if (peak > peakTempTimesN)
 		{
-			if ((int)i == firstPeakIndex + 1)
+			if ((int)i == lastSameIndex + 1)
 			{
-				firstPeakIndex = (int)i;	// readings still going up or staying the same, so advance the first peak index
+				firstPeakIndex = lastSameIndex = (int)i;	// readings still going up or staying the same, so advance the first peak index
 				peakTempTimesN = peak;
 			}
 			else
 			{
-				return -1;					// error, more than one peak
+				return -1;						// error, more than one peak
 			}
+		}
+		else if (peak == peakTempTimesN)		// exact equality can occur because the floating point value is computed from an integral value
+		{
+			lastSameIndex = (int)i;
 		}
 	}
 	return firstPeakIndex + (numToAverage - 1)/2;
@@ -793,11 +817,17 @@ void PID::CalculateModel()
 		DisplayBuffer("At completion");
 	}
 	const float tc = (float)((tuningReadingsTaken - 1) * tuningReadingInterval)/(1000.0 * log((tuningTempReadings[0] - tuningStartTemp)/(tuningTempReadings[tuningReadingsTaken - 1] - tuningStartTemp)));
-	const float td = (float)tuningPeakDelay * 0.001;
 	const float heatingTime = (tuningHeatingTime - tuningPeakDelay) * 0.001;
 	const float gain = (tuningHeaterOffTemp - tuningStartTemp)/(1.0 - exp(-heatingTime/tc));
 
-	tuned = SetModel(gain, tc, td, model.GetMaxPwm(), true);
+	// There are two ways of calculating the dead time:
+	// 1. Based on the delay to peak temperature after we turned the heater off. Adding 0.5sec and then taking 65% of the result is about right.
+	// 2. Based on the peak temperature compared to the temperature at which we turned the heater off.
+	// Try #2 because it is easier to identify the peak temperature than the delay to peak temperature. It can be slightly to aggressive, so add 30%.
+	//const float td = (float)(tuningPeakDelay + 500) * 0.00065;		// take the dead time as 65% of the delay to peak rounded up to a half second
+	const float td = tc * logf((gain + tuningStartTemp - tuningHeaterOffTemp)/(gain + tuningStartTemp - tuningPeakTemperature)) * 1.3;
+
+	tuned = SetModel(gain, tc, td, tuningPwm, true);
 	if (tuned)
 	{
 		platform.MessageF(GENERIC_MESSAGE,
@@ -825,5 +855,19 @@ void PID::DisplayBuffer(const char *intro)
 		platform.Message(HOST_MESSAGE, buf);
 	}
 }
+
+#ifdef DUET_NG
+
+// Suspend the heater to conserve power, or resume it
+void PID::Suspend(bool sus)
+{
+	suspended = sus;
+	if (sus && model.IsEnabled())
+	{
+		SetHeater(0.0);
+	}
+}
+
+#endif
 
 // End

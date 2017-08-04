@@ -14,7 +14,7 @@
 // Create a default GCodeBuffer
 GCodeBuffer::GCodeBuffer(const char* id, MessageType mt, bool usesCodeQueue)
 	: machineState(new GCodeMachineState()), identity(id), checksumRequired(false), writingFileDirectory(nullptr),
-	  toolNumberAdjust(0), responseMessageType(mt), queueCodes(usesCodeQueue)
+	  toolNumberAdjust(0), responseMessageType(mt), queueCodes(usesCodeQueue), binaryWriting(false)
 {
 	Init();
 }
@@ -28,6 +28,7 @@ void GCodeBuffer::Reset()
 void GCodeBuffer::Init()
 {
 	gcodePointer = 0;
+	commandLength = 0;
 	readPointer = -1;
 	inQuotes = inComment = timerRunning = false;
 	bufferState = GCodeBufferState::idle;
@@ -75,7 +76,12 @@ int GCodeBuffer::CheckSum() const
 // not yet complete.  If true, it is complete and ready to be acted upon.
 bool GCodeBuffer::Put(char c)
 {
-	if (!inQuotes && c == ';')
+	if (c != 0)
+	{
+		++commandLength;
+	}
+
+	if (!inQuotes && ((c == ';') || (gcodePointer == 0 && c == '(')))
 	{
 		inComment = true;
 	}
@@ -135,7 +141,7 @@ bool GCodeBuffer::Put(char c)
 			Init();
 			return false;
 		}
-		Init();
+		readPointer = -1;;
 		bufferState = GCodeBufferState::ready;
 		return true;
 	}
@@ -172,8 +178,29 @@ bool GCodeBuffer::Put(const char *str, size_t len)
 	return false;
 }
 
-// Does this buffer contain any code?
+void GCodeBuffer::SetFinished(bool f)
+{
+	if (f)
+	{	bufferState = GCodeBufferState::idle;
+		Init();
+	}
+	else
+	{
+		bufferState = GCodeBufferState::executing;
+	}
+}
 
+// Get the file position at the start of the current command
+FilePosition GCodeBuffer::GetFilePosition(size_t bytesCached) const
+{
+	if (machineState->fileState.IsLive())
+	{
+		return machineState->fileState.GetPosition() - bytesCached - commandLength;
+	}
+	return noFilePosition;
+}
+
+// Does this buffer contain any code?
 bool GCodeBuffer::IsEmpty() const
 {
 	const char *buf = gcodeBuffer;
@@ -207,7 +234,7 @@ bool GCodeBuffer::Seen(char c)
 			{
 				break;
 			}
-			if (b == c)
+			if (toupper(b) == c)
 			{
 				return true;
 			}
@@ -224,8 +251,9 @@ char GCodeBuffer::GetCommandLetter()
 	readPointer = 0;
 	for (;;)
 	{
-		const char b = gcodeBuffer[readPointer];
+		char b = gcodeBuffer[readPointer];
 		if (b == 0 || b == ';') break;
+		b = (char)toupper(b);
 		if (b == 'G' || b == 'M' || b == 'T')
 		{
 			return b;
@@ -441,6 +469,20 @@ int32_t GCodeBuffer::GetIValue()
 	return result;
 }
 
+// Get an uint32 after a G Code letter
+uint32_t GCodeBuffer::GetUIValue()
+{
+	if (readPointer < 0)
+	{
+		reprap.GetPlatform().Message(GENERIC_MESSAGE, "Error: GCodes: Attempt to read a GCode int before a search.\n");
+		readPointer = -1;
+		return 0;
+	}
+	const uint32_t result = strtoul(&gcodeBuffer[readPointer + 1], 0, 0);
+	readPointer = -1;
+	return result;
+}
+
 // If the specified parameter character is found, fetch 'value' and set 'seen'. Otherwise leave val and seen alone.
 void GCodeBuffer::TryGetFValue(char c, float& val, bool& seen)
 {
@@ -462,14 +504,14 @@ void GCodeBuffer::TryGetIValue(char c, int32_t& val, bool& seen)
 }
 
 // Try to get a float array exactly 'numVals' long after parameter letter 'c'.
-// If the wrong number of value is provided, generate an error message and return true.
+// If the wrong number of values is provided, generate an error message and return true.
 // Else set 'seen' if we saw the letter and value, and return false.
-bool GCodeBuffer::TryGetFloatArray(char c, size_t numVals, float vals[], StringRef& reply, bool& seen)
+bool GCodeBuffer::TryGetFloatArray(char c, size_t numVals, float vals[], StringRef& reply, bool& seen, bool doPad)
 {
 	if (Seen(c))
 	{
 		size_t count = numVals;
-		GetFloatArray(vals, count, false);
+		GetFloatArray(vals, count, doPad);
 		if (count == numVals)
 		{
 			seen = true;
@@ -484,13 +526,15 @@ bool GCodeBuffer::TryGetFloatArray(char c, size_t numVals, float vals[], StringR
 }
 
 // Try to get a quoted string after parameter letter.
-// If we found it then set 'seen' true, else leave 'seen' alone
-void GCodeBuffer::TryGetQuotedString(char c, char *buf, size_t buflen, bool& seen)
+// If we found it then set 'seen' true and return true, else leave 'seen' alone and return false
+bool GCodeBuffer::TryGetQuotedString(char c, char *buf, size_t buflen, bool& seen)
 {
 	if (Seen(c) && GetQuotedString(buf, buflen))
 	{
 		seen = true;
+		return true;
 	}
+	return false;
 }
 
 // Get an IP address quad after a key letter

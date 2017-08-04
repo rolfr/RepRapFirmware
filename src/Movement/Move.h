@@ -16,11 +16,18 @@
 #include "Kinematics/Kinematics.h"
 #include "GCodes/RestorePoint.h"
 
+// Define the number of DDAs and DMs.
+// A DDA represents a move in the queue.
+// Each DDA needs one DM per drive that it moves.
+// However, DM's are large, so we provide fewer than DRIVES * DdaRingLength of them. The planner checks that enough DMs are available before filling in a new DDA.
+
 #ifdef DUET_NG
 const unsigned int DdaRingLength = 30;
+const unsigned int NumDms = DdaRingLength * 8;						// suitable for e.g. a delta + 5 input hot end
 #else
 // We are more memory-constrained on the SAM3X
 const unsigned int DdaRingLength = 20;
+const unsigned int NumDms = DdaRingLength * 5;						// suitable for e.g. a delta + 1-input hot end
 #endif
 
 /**
@@ -35,16 +42,14 @@ public:
 	void Exit();													// Shut down
 
 	void GetCurrentMachinePosition(float m[DRIVES], bool disableMotorMapping) const; // Get the current position in untransformed coords
-	void GetCurrentUserPosition(float m[DRIVES], uint8_t moveType, uint32_t xAxes) const; // Return the position (after all queued moves have been executed) in transformed coords
-	int32_t GetEndPoint(size_t drive) const { return liveEndPoints[drive]; } // Get the current position of a motor
-	void LiveCoordinates(float m[DRIVES], uint32_t xAxes);			// Gives the last point at the end of the last complete DDA transformed to user coords
+	void GetCurrentUserPosition(float m[DRIVES], uint8_t moveType, AxesBitmap xAxes, AxesBitmap yAxes) const;
+																	// Return the position (after all queued moves have been executed) in transformed coords
+	int32_t GetEndPoint(size_t drive) const { return liveEndPoints[drive]; } 	// Get the current position of a motor
+	void LiveCoordinates(float m[DRIVES], AxesBitmap xAxes, AxesBitmap yAxes);	// Gives the last point at the end of the last complete DDA transformed to user coords
 	void Interrupt();												// The hardware's (i.e. platform's)  interrupt should call this.
 	void InterruptTime();											// Test function - not used
 	bool AllMovesAreFinished();										// Is the look-ahead ring empty?  Stops more moves being added as well.
 	void DoLookAhead();												// Run the look-ahead procedure
-	void HitLowStop(size_t axis, DDA* hitDDA);						// What to do when a low endstop is hit
-	void HitHighStop(size_t axis, DDA* hitDDA);						// What to do when a high endstop is hit
-	void ZProbeTriggered(DDA* hitDDA);								// What to do when a the Z probe is triggered
 	void SetNewPosition(const float positionNow[DRIVES], bool doBedCompensation); // Set the current position to be this
 	void SetLiveCoordinates(const float coords[DRIVES]);			// Force the live coordinates (see above) to be these
 	void ResetExtruderPositions();									// Resets the extrusion amounts of the live coordinates
@@ -52,11 +57,13 @@ public:
 	void SetZBedProbePoint(size_t index, float z, bool wasXyCorrected, bool wasError); // Record the Z coordinate of a probe point
 	float GetProbeCoordinates(int count, float& x, float& y, bool wantNozzlePosition) const; // Get pre-recorded probe coordinates
 	void FinishedBedProbing(int sParam, StringRef& reply);			// Calibrate or set the bed equation after probing
-	void SetAxisCompensation(int8_t axis, float tangent);			// Set an axis-pair compensation angle
-	float AxisCompensation(int8_t axis) const;						// The tangent value
+	void SetAxisCompensation(unsigned int axis, float tangent);		// Set an axis-pair compensation angle
+	float AxisCompensation(unsigned int axis) const;				// The tangent value
 	void SetIdentityTransform();									// Cancel the bed equation; does not reset axis angle compensation
-	void AxisAndBedTransform(float move[], uint32_t xAxes, bool useBedCompensation) const; // Take a position and apply the bed and the axis-angle compensations
-	void InverseAxisAndBedTransform(float move[], uint32_t xAxes) const;	// Go from a transformed point back to user coordinates
+	void AxisAndBedTransform(float move[], AxesBitmap xAxes, AxesBitmap yAxes, bool useBedCompensation) const;
+																	// Take a position and apply the bed and the axis-angle compensations
+	void InverseAxisAndBedTransform(float move[], AxesBitmap xAxes, AxesBitmap yAxes) const;
+																	// Go from a transformed point back to user coordinates
 	float GetTaperHeight() const { return (useTaper) ? taperHeight : 0.0; }
 	void SetTaperHeight(float h);
 	bool UseMesh(bool b);											// Try to enable mesh bed compensation and report the final state
@@ -81,6 +88,8 @@ public:
 	bool IsDeltaMode() const { return kinematics->GetKinematicsType() == KinematicsType::linearDelta; }
 	// End temporary functions
 
+	bool IsRawMotorMove(uint8_t moveType) const;									// Return true if this is a raw motor move
+
 	void CurrentMoveCompleted();													// Signal that the current move has just been completed
 	bool TryStartNextMove(uint32_t startTime);										// Try to start another move, returning true if Step() needs to be called immediately
 	float IdleTimeout() const { return idleTimeout; }								// Returns the idle timeout in seconds
@@ -90,7 +99,7 @@ public:
 	float GetSimulationTime() const { return simulationTime; }						// Get the accumulated simulation time
 	void PrintCurrentDda() const;													// For debugging
 
-	FilePosition PausePrint(RestorePoint& rp, uint32_t xAxes);						// Pause the print as soon as we can
+	bool PausePrint(RestorePoint& rp);												// Pause the print as soon as we can, returning true if we were able to
 	bool NoLiveMovement() const;													// Is a move running, or are there any queued?
 
 	bool IsExtruding() const;														// Is filament being extruded?
@@ -103,19 +112,24 @@ public:
 
 	const DDA *GetCurrentDDA() const { return currentDda; }							// Return the DDA of the currently-executing move
 
+	void AdjustLeadscrews(const floatc_t corrections[]);							// Called by some Kinematics classes to adjust the leadscrews
+
+#ifdef DUET_NG
+	bool WriteResumeSettings(FileStore *f) const;									// Write settings for resuming the print
+#endif
+
 	static int32_t MotorEndPointToMachine(size_t drive, float coord);				// Convert a single motor position to number of steps
 	static float MotorEndpointToPosition(int32_t endpoint, size_t drive);			// Convert number of motor steps to motor position
 
 private:
 	enum class IdleState : uint8_t { idle, busy, timing };
 
-	bool StartNextMove(uint32_t startTime);											// start the next move, returning true if Step() needs to be called immediately
-	void BedTransform(float move[MaxAxes], uint32_t xAxes) const;					// Take a position and apply the bed compensations
-	void InverseBedTransform(float move[MaxAxes], uint32_t xAxes) const;			// Go from a bed-transformed point back to user coordinates
-	void AxisTransform(float move[MaxAxes]) const;									// Take a position and apply the axis-angle compensations
-	void InverseAxisTransform(float move[MaxAxes]) const;							// Go from an axis transformed point back to user coordinates
-	void JustHomed(size_t axis, float hitPoint, DDA* hitDDA);						// Deal with setting positions after a drive has been homed
-	void SetPositions(const float move[DRIVES]);									// Force the machine coordinates to be these
+	bool StartNextMove(uint32_t startTime);														// Start the next move, returning true if Step() needs to be called immediately
+	void BedTransform(float move[MaxAxes], AxesBitmap xAxes, AxesBitmap yAxes) const;			// Take a position and apply the bed compensations
+	void InverseBedTransform(float move[MaxAxes], AxesBitmap xAxes, AxesBitmap yAxes) const;	// Go from a bed-transformed point back to user coordinates
+	void AxisTransform(float move[MaxAxes], AxesBitmap xAxes, AxesBitmap yAxes) const;			// Take a position and apply the axis-angle compensations
+	void InverseAxisTransform(float move[MaxAxes], AxesBitmap xAxes, AxesBitmap yAxes) const;	// Go from an axis transformed point back to user coordinates
+	void SetPositions(const float move[DRIVES]);												// Force the machine coordinates to be these
 
 	bool DDARingAdd();									// Add a processed look-ahead entry to the DDA ring
 	DDA* DDARingGet();									// Get the next DDA ring entry to be run
@@ -139,7 +153,11 @@ private:
 	volatile bool liveCoordinatesValid;					// True if the XYZ live coordinates are reliable (the extruder ones always are)
 	volatile int32_t liveEndPoints[DRIVES];				// The XYZ endpoints of the last completed move in motor coordinates
 
-	float tanXY, tanYZ, tanXZ; 							// Axis compensation - 90 degrees + angle gives angle between axes
+	float tangents[3]; 									// Axis compensation - 90 degrees + angle gives angle between axes
+	float& tanXY = tangents[0];
+	float& tanYZ = tangents[1];
+	float& tanXZ = tangents[2];
+
 	float recipTaperHeight;								// Reciprocal of the taper height
 	bool useTaper;										// True to taper off the compensation
 
@@ -158,13 +176,17 @@ private:
 	unsigned int stepErrors;							// count of step errors, for diagnostics
 	uint32_t scheduledMoves;							// Move counters for the code queue
 	volatile uint32_t completedMoves;					// This one is modified by an ISR, hence volatile
+
+	float specialMoveCoords[DRIVES];					// Amounts by which to move individual motors (leadscrew adjustment move)
+	bool specialMoveAvailable;							// True if a leadscrew adjustment move is pending
 };
 
 //******************************************************************************************************
 
 inline bool Move::DDARingEmpty() const
 {
-	return ddaRingGetPointer == ddaRingAddPointer;
+	return ddaRingGetPointer == ddaRingAddPointer		// by itself this means the ring is empty or full
+		&& ddaRingAddPointer->GetState() == DDA::DDAState::empty;
 }
 
 inline bool Move::NoLiveMovement() const
@@ -189,6 +211,7 @@ pre(ddaRingGetPointer->GetState() == DDA::frozen)
 }
 
 // This is the function that is called by the timer interrupt to step the motors.
+// This may occasionally get called prematurely.
 inline void Move::Interrupt()
 {
 	if (currentDda != nullptr)

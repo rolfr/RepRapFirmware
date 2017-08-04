@@ -32,11 +32,13 @@ public:
 	void MotorStepsToCartesian(const int32_t motorPos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, float machinePos[]) const override;
 	bool SupportsAutoCalibration() const override { return false; }
 	bool IsReachable(float x, float y) const override;
-	bool LimitPosition(float position[], size_t numAxes, uint16_t axesHomed) const override;
+	bool LimitPosition(float position[], size_t numAxes, AxesBitmap axesHomed) const override;
 	void GetAssumedInitialPosition(size_t numAxes, float positions[]) const override;
 	const char* HomingButtonNames() const override { return "PDZUVW"; }
-	bool DriveIsShared(size_t drive) const override;
-	HomingMode GetHomingMode() const override { return homeSharedMotors; }
+	HomingMode GetHomingMode() const override { return homeIndividualMotors; }
+	AxesBitmap AxesAssumedHomed(AxesBitmap g92Axes) const override;
+	const char* GetHomingFileName(AxesBitmap toBeHomed, AxesBitmap& alreadyHomed, size_t numVisibleAxes, AxesBitmap& mustHomeFirst) const override;
+	bool OnHomingSwitchTriggered(size_t axis, bool highEnd, const float stepsPerMm[], DDA& dda) const override;
 
 private:
 	static constexpr float DefaultSegmentsPerSecond = 200.0;
@@ -48,6 +50,9 @@ private:
 	static constexpr float DefaultMinPhiMinusTheta = -135.0;					// minimum distal joint angle
 	static constexpr float DefaultMaxPhiMinusTheta = 135.0;						// maximum distal joint angle
 
+	static constexpr const char *HomeProximalFileName = "homeproximal.g";
+	static constexpr const char *HomeDistalFileName = "homedistal.g";
+
 	void Recalc();
 
 	// Primary parameters
@@ -56,6 +61,8 @@ private:
 	float thetaLimits[2];							// minimum proximal joint angle
 	float phiMinusThetaLimits[2];					// minimum distal joint angle
 	float crosstalk[3];								// if we rotate the distal arm motor, for each full rotation the Z height goes up by this amount
+	float xOffset;									// where bed X=0 is relative to the proximal joint
+	float yOffset;									// where bed Y=0 is relative to the proximal joint
 
 	// Derived parameters
 	float minRadius;

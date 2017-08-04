@@ -11,6 +11,58 @@
 #include "RepRap.h"
 #include "Libraries/Math/Isqrt.h"
 
+// Static members
+
+DriveMovement *DriveMovement::freeList = nullptr;
+int DriveMovement::numFree = 0;
+int DriveMovement::minFree = 0;
+
+void DriveMovement::InitialAllocate(unsigned int num)
+{
+	while (num != 0)
+	{
+		freeList = new DriveMovement(freeList);
+		++numFree;
+		--num;
+	}
+	ResetMinFree();
+}
+
+DriveMovement *DriveMovement::Allocate(size_t drive, DMState st)
+{
+	DriveMovement *dm = freeList;
+	if (dm != nullptr)
+	{
+		freeList = dm->nextDM;
+		--numFree;
+		if (numFree < minFree)
+		{
+			minFree = numFree;
+		}
+		dm->nextDM = nullptr;
+		dm->drive = (uint8_t)drive;
+		dm->state = st;
+	}
+	return dm;
+}
+
+void DriveMovement::Release(DriveMovement *item)
+{
+	if (item != nullptr)
+	{
+		item->nextDM = freeList;
+		freeList = item;
+		++numFree;
+	}
+}
+
+// Constructors
+DriveMovement::DriveMovement(DriveMovement *next) : nextDM(next)
+{
+}
+
+// Non static members
+
 // Prepare this DM for a Cartesian axis move
 void DriveMovement::PrepareCartesianAxis(const DDA& dda, const PrepParams& params)
 {
@@ -123,13 +175,13 @@ void DriveMovement::PrepareExtruder(const DDA& dda, const PrepParams& params, bo
 		twoDistanceToStopTimesCsquaredDivA =
 			initialDecelSpeedTimesCdivASquared + (uint64_t)(((params.decelStartDistance + accelCompensationDistance) * (DDA::stepClockRateSquared * 2))/dda.acceleration);
 
+		// Calculate the move distance to the point of zero speed, where reverse motion starts
 		const float initialDecelSpeed = dda.topSpeed - dda.acceleration * compensationTime;
 		const float reverseStartDistance = (initialDecelSpeed > 0.0)
 												? fsquare(initialDecelSpeed)/(2 * dda.acceleration) + params.decelStartDistance
 												: params.decelStartDistance;
-
 		// Reverse phase parameters
-		if (reverseStartDistance >= dda.totalDistance + compensationDistance)
+		if (reverseStartDistance >= dda.totalDistance)
 		{
 			// No reverse phase
 			totalSteps = (uint)max<int32_t>(netSteps, 0);

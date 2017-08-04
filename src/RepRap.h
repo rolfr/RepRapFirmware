@@ -61,7 +61,9 @@ public:
 	Tool* GetCurrentTool() const;
 	Tool* GetTool(int toolNumber) const;
 	Tool* GetCurrentOrDefaultTool() const;
+	const Tool* GetFirstTool() const { return toolList; }				// Return the lowest-numbered tool
 	uint32_t GetCurrentXAxes() const;									// Get the current axes used as X axes
+	uint32_t GetCurrentYAxes() const;									// Get the current axes used as Y axes
 	void SetToolVariables(int toolNumber, const float* standbyTemperatures, const float* activeTemperatures);
 	bool IsHeaterAssignedToTool(int8_t heater) const;
 	unsigned int GetNumberOfContiguousTools() const;
@@ -99,8 +101,12 @@ public:
 
 	void Beep(int freq, int ms);
 	void SetMessage(const char *msg);
-	void SetAlert(const char *msg, const char *title, int mode, float timeout, bool showZControls);
+	void SetAlert(const char *msg, const char *title, int mode, float timeout, AxesBitmap controls);
 	void ClearAlert();
+
+#ifdef DUET_NG
+	bool WriteToolSettings(FileStore *f) const;				// Save some resume information
+#endif
 
 	static void CopyParameterText(const char* src, char *dst, size_t length);
 	static uint32_t DoDivide(uint32_t a, uint32_t b);		// helper function for diagnostic tests
@@ -124,7 +130,7 @@ private:
  	PortControl *portControl;
 #endif
 
-	Tool* toolList;
+	Tool* toolList;								// the tool list is sorted in order of increasing tool number
 	Tool* currentTool;
 	uint32_t lastWarningMillis;					// When we last sent a warning message for things that can happen very often
 
@@ -152,7 +158,7 @@ private:
 	char boxMessage[MESSAGE_LENGTH + 1], boxTitle[MESSAGE_LENGTH + 1];
 	int boxMode;
 	uint32_t boxTimer, boxTimeout;
-	bool boxZControls;
+	AxesBitmap boxControls;
 };
 
 inline Platform& RepRap::GetPlatform() const { return *platform; }

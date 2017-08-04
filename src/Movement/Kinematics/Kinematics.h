@@ -8,8 +8,13 @@
 #ifndef SRC_MOVEMENT_KINEMATICS_H_
 #define SRC_MOVEMENT_KINEMATICS_H_
 
-#include "GCodes/GCodeBuffer.h"
-#include "Movement/BedProbing/RandomProbePointSet.h"
+#include "RepRapFirmware.h"
+#include "Libraries/Math/Matrix.h"
+
+inline floatc_t fcsquare(floatc_t a)
+{
+	return a * a;
+}
 
 // Different types of kinematics we support. Each of these has a class to represent it.
 // These must have the same numeric assignments as the K parameter of the M669 command, as documented in ???
@@ -75,10 +80,10 @@ public:
 	virtual void MotorStepsToCartesian(const int32_t motorPos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, float machinePos[]) const = 0;
 
 	// Return true if the kinematics supports auto calibration based on bed probing.
-	// Normally returns false, but overridden for delta kinematics.
+	// Normally returns false, but overridden for delta kinematics and kinematics with multiple independently-drive Z leadscrews.
 	virtual bool SupportsAutoCalibration() const { return false; }
 
-	// Perform auto calibration. Override this implementation in kinematics that support it.
+	// Perform auto calibration. Override this implementation in kinematics that support it. Caller already owns the movement lock.
 	virtual void DoAutoCalibration(size_t numFactors, const RandomProbePointSet& probePoints, StringRef& reply)
 	pre(SupportsAutoCalibration()) { }
 
@@ -100,11 +105,11 @@ public:
 
 	// Limit the Cartesian position that the user wants to move to, returning true if any coordinates were changed
 	// The default implementation just applies the rectangular limits set up by M208 to those axes that have been homed.
-	virtual bool LimitPosition(float coords[], size_t numVisibleAxes, uint16_t axesHomed) const;
+	virtual bool LimitPosition(float coords[], size_t numVisibleAxes, AxesBitmap axesHomed) const;
 
 	// Return the set of axes that must have been homed before bed probing is allowed
 	// The default implementation requires just X and Y, but some kinematics require additional axes to be homed (e.g. delta, CoreXZ)
-	virtual uint16_t AxesToHomeBeforeProbing() const { return (1 << X_AXIS) | (1 << Y_AXIS); }
+	virtual AxesBitmap AxesToHomeBeforeProbing() const { return MakeBitmap<AxesBitmap>(X_AXIS) | MakeBitmap<AxesBitmap>(Y_AXIS); }
 
 	// Return the initial Cartesian coordinates we assume after switching to this kinematics
 	virtual void GetAssumedInitialPosition(size_t numAxes, float positions[]) const;
@@ -118,12 +123,28 @@ public:
 	// Override this if the homing buttons are not named after the axes (e.g. SCARA printer)
 	virtual const char* HomingButtonNames() const { return "XYZUVW"; }
 
-	// Return true if the specified endstop axis uses shared motors.
-	// Used to determine whether to abort the whole move or just one motor when an endstop switch is triggered.
-	virtual bool DriveIsShared(size_t drive) const = 0;
+	// This function is called when a request is made to home the axes in 'toBeHomed' and the axes in 'alreadyHomed' have already been homed.
+	// If we can proceed with homing some axes, return the name of the homing file to be called. Optionally, update 'alreadyHomed' to indicate
+	// that some additional axes should be considered not homed.
+	// If we can't proceed because other axes need to be homed first, return nullptr and pass those axes back in 'mustBeHomedFirst'.
+	virtual const char* GetHomingFileName(AxesBitmap toBeHomed, AxesBitmap& alreadyHomed, size_t numVisibleAxes, AxesBitmap& mustHomeFirst) const;
+
+	// This function is called from the step ISR when an endstop switch is triggered during homing.
+	// Take the action needed to define the current position, normally by calling dda.SetDriveCoordinate() or dda.SetPositions().
+	// Return true if the entire move should be stopped, false if only the motor concerned should be stopped.
+	virtual bool OnHomingSwitchTriggered(size_t axis, bool highEnd, const float stepsPerMm[], DDA& dda) const = 0;
 
 	// Return the type of homing we do
 	virtual HomingMode GetHomingMode() const = 0;
+
+	// Return the axes that we can assume are homed after executing a G92 command to set the specified axis coordinates
+	// This default is good for Cartesian and Core printers, but not deltas or SCARA
+	virtual AxesBitmap AxesAssumedHomed(AxesBitmap g92Axes) const { return g92Axes; }
+
+#ifdef DUET_NG
+	// Write any calibration data that we need to resume a print after power fail, returning true if successful. Override where necessary.
+	virtual bool WriteResumeSettings(FileStore *f) const { return true; }
+#endif
 
 	// Override this virtual destructor if your constructor allocates any dynamic memory
 	virtual ~Kinematics() { }
@@ -147,8 +168,15 @@ protected:
 	// This constructor is used by derived classes that implement segmented linear motion
 	Kinematics(KinematicsType t, float segsPerSecond, float minSegLength, bool doUseRawG0);
 
+	// Debugging functions
+	static void PrintMatrix(const char* s, const MathMatrix<floatc_t>& m, size_t numRows = 0, size_t maxCols = 0);
+	static void PrintVector(const char *s, const floatc_t *v, size_t numElems);
+
 	float segmentsPerSecond;				// if we are using segmentation, the target number of segments/second
 	float minSegmentLength;					// if we are using segmentation, the minimum segment size
+
+	static const char *HomeAllFileName;
+	static const char * const StandardHomingFileNames[];
 
 private:
 	bool useSegmentation;					// true if we have to approximate linear movement using segmentation

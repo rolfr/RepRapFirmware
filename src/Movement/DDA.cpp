@@ -72,10 +72,10 @@ void DDA::LogProbePosition()
 		int32_t *p = loggedProbePositions + (numLoggedProbePositions * XYZ_AXES);
 		for (size_t drive = 0; drive < XYZ_AXES; ++drive)
 		{
-			DriveMovement& dm = ddm[drive];
-			if (dm.state == DMState::moving)
+			DriveMovement *dm = pddm[drive];
+			if (dm != nullptr && dm->state == DMState::moving)
 			{
-				p[drive] = endPoint[drive] - dm.GetNetStepsLeft();
+				p[drive] = endPoint[drive] - dm->GetNetStepsLeft();
 			}
 			else
 			{
@@ -90,7 +90,22 @@ void DDA::LogProbePosition()
 
 DDA::DDA(DDA* n) : next(n), prev(nullptr), state(empty)
 {
-	memset(ddm, 0, sizeof(ddm));	//DEBUG to clear stepError field
+	for (DriveMovement*& p : pddm)
+	{
+		p = nullptr;
+	}
+}
+
+void DDA::ReleaseDMs()
+{
+	for (DriveMovement*& p : pddm)
+	{
+		if (p != nullptr)
+		{
+			DriveMovement::Release(p);
+			p = nullptr;
+		}
+	}
 }
 
 // Return the number of clocks this DDA still needs to execute.
@@ -168,13 +183,16 @@ void DDA::DebugPrint() const
 				accelDistance, decelDistance, clocksNeeded);
 	for (size_t axis = 0; axis < numAxes; ++axis)
 	{
-		ddm[axis].DebugPrint(reprap.GetGCodes().axisLetters[axis], isDeltaMovement);
+		if (pddm[axis] != nullptr)
+		{
+			pddm[axis]->DebugPrint(reprap.GetGCodes().axisLetters[axis], isDeltaMovement);
+		}
 	}
 	for (size_t i = numAxes; i < DRIVES; ++i)
 	{
-		if (ddm[i].state != DMState::idle)
+		if (pddm[i] != nullptr && pddm[i]->state != DMState::idle)
 		{
-			ddm[i].DebugPrint((char)('0' + (i - numAxes)), false);
+			pddm[i]->DebugPrint((char)('0' + (i - numAxes)), false);
 		}
 	}
 }
@@ -184,13 +202,18 @@ void DDA::Init()
 {
 	// Set the endpoints to zero, because Move asks for them.
 	// They will be wrong if we are on a delta. We take care of that when we process the M665 command in config.g.
-	for (size_t drive = 0; drive < DRIVES; ++drive)
+	for (int32_t& ep : endPoint)
 	{
-		endPoint[drive] = 0;
-		ddm[drive].state = DMState::idle;
+		ep = 0;
 	}
 	state = empty;
 	endCoordinatesValid = false;
+	virtualExtruderPosition = 0;
+	filePos = noFilePosition;
+
+#if SUPPORT_IOBITS
+	ioBits = 0;
+#endif
 }
 
 // Set up a real move. Return true if it represents real movement, else false.
@@ -216,7 +239,6 @@ bool DDA::Init(const GCodes::RawMove &nextMove, bool doMotorMapping)
 	isPrintingMove = false;
 	bool realMove = false, xyzMoving = false;
 	xyMoving = false;
-	const bool isSpecialDeltaMove = (move.IsDeltaMode() && !doMotorMapping);
 	float accelerations[DRIVES];
 	const float * const normalAccelerations = reprap.GetPlatform().Accelerations();
 	const size_t numAxes = reprap.GetGCodes().GetTotalAxes();
@@ -231,8 +253,8 @@ bool DDA::Init(const GCodes::RawMove &nextMove, bool doMotorMapping)
 		endCoordinates[drive] = nextMove.coords[drive];
 		const int32_t delta = (drive < numAxes) ? endPoint[drive] - positionNow[drive] : endPoint[drive];
 
-		DriveMovement& dm = ddm[drive];
-		if (drive < numAxes && !isSpecialDeltaMove)
+		DriveMovement*& pdm = pddm[drive];
+		if (drive < numAxes && doMotorMapping)
 		{
 			const float positionDelta = nextMove.coords[drive] - prev->GetEndCoordinate(drive, false);
 			directionVector[drive] = positionDelta;
@@ -247,20 +269,24 @@ bool DDA::Init(const GCodes::RawMove &nextMove, bool doMotorMapping)
 					xyMoving = xyzMoving = true;
 				}
 			}
-			dm.state = (isDeltaMovement || delta != 0)
-						? DMState::moving				// on a delta printer, if one tower moves then we assume they all do
-						: DMState::idle;
+			if (isDeltaMovement || delta != 0)
+			{
+				pdm = DriveMovement::Allocate(drive, DMState::moving);	// on a delta printer, if one tower moves then we assume they all do
+			}
 		}
 		else
 		{
 			directionVector[drive] = (float)delta/reprap.GetPlatform().DriveStepsPerUnit(drive);
-			dm.state = (delta != 0) ? DMState::moving : DMState::idle;
+			if (delta != 0)
+			{
+				pdm = DriveMovement::Allocate(drive, DMState::moving);
+			}
 		}
 
-		if (dm.state == DMState::moving)
+		if (pdm != nullptr)
 		{
-			dm.totalSteps = labs(delta);				// for now this is the number of net steps, but gets adjusted later if there is a reverse in direction
-			dm.direction = (delta >= 0);				// for now this is the direction of net movement, but gets adjusted later if it is a delta movement
+			pdm->totalSteps = labs(delta);				// for now this is the number of net steps, but gets adjusted later if there is a reverse in direction
+			pdm->direction = (delta >= 0);				// for now this is the direction of net movement, but gets adjusted later if it is a delta movement
 			realMove = true;
 
 			if (drive >= numAxes && xyMoving)
@@ -285,23 +311,35 @@ bool DDA::Init(const GCodes::RawMove &nextMove, bool doMotorMapping)
 	// 2. Throw it away if there's no real movement.
 	if (!realMove)
 	{
+		ReleaseDMs();
 		return false;
 	}
 
 	// 3. Store some values
 	xAxes = nextMove.xAxes;
+	yAxes = nextMove.yAxes;
 	endStopsToCheck = nextMove.endStopsToCheck;
+	canPauseBefore = nextMove.canPauseBefore;
 	canPauseAfter = nextMove.canPauseAfter;
 	filePos = nextMove.filePos;
 	usePressureAdvance = nextMove.usePressureAdvance;
+	virtualExtruderPosition = nextMove.virtualExtruderPosition;
 	hadLookaheadUnderrun = false;
+	isLeadscrewAdjustmentMove = false;
+	goingSlow = false;
 
 #if SUPPORT_IOBITS
 	ioBits = nextMove.ioBits;
 #endif
 
-	// The end coordinates will be valid at the end of this move if it does not involve endstop checks and is not a special move on a delta printer
-	endCoordinatesValid = (endStopsToCheck == 0) && (doMotorMapping || !move.IsDeltaMode());
+	// If it's a Z probing move, limit the Z acceleration to better handle nozzle-contact probes
+	if ((endStopsToCheck & ZProbeActive) != 0 && accelerations[Z_AXIS] > ZProbeMaxAcceleration)
+	{
+		accelerations[Z_AXIS] = ZProbeMaxAcceleration;
+	}
+
+	// The end coordinates will be valid at the end of this move if it does not involve endstop checks and is not a raw motor move
+	endCoordinatesValid = (endStopsToCheck == 0) && doMotorMapping;
 
 	// 4. Normalise the direction vector and compute the amount of motion.
 	if (xyzMoving)
@@ -338,7 +376,7 @@ bool DDA::Init(const GCodes::RawMove &nextMove, bool doMotorMapping)
 	// 6. Set the speed to the smaller of the requested and maximum speed.
 	// Also enforce a minimum speed of 0.5mm/sec. We need a minimum speed to avoid overflow in the movement calculations.
 	float reqSpeed = nextMove.feedRate;
-	if (isSpecialDeltaMove)
+	if (!doMotorMapping)
 	{
 		// Special case of a raw or homing move on a delta printer
 		// We use the Cartesian motion system to implement these moves, so the feed rate will be interpreted in Cartesian coordinates.
@@ -358,21 +396,38 @@ bool DDA::Init(const GCodes::RawMove &nextMove, bool doMotorMapping)
 	}
 	requestedSpeed = constrain<float>(reqSpeed, 0.5, VectorBoxIntersection(normalisedDirectionVector, reprap.GetPlatform().MaxFeedrates(), DRIVES));
 
-	// On a Cartesian or CoreXY printer, it is OK to limit the X and Y speeds and accelerations independently, and in consequence to allow greater values
+	// On a Cartesian printer, it is OK to limit the X and Y speeds and accelerations independently, and in consequence to allow greater values
 	// for diagonal moves. On a delta, this is not OK and any movement in the XY plane should be limited to the X/Y axis values, which we assume to be equal.
-	if (isDeltaMovement)
+	if (doMotorMapping)
 	{
-		const float xyFactor = sqrtf(fsquare(normalisedDirectionVector[X_AXIS]) + fsquare(normalisedDirectionVector[Y_AXIS]));
-		const float maxSpeed = reprap.GetPlatform().MaxFeedrates()[X_AXIS];
-		if (requestedSpeed * xyFactor > maxSpeed)
+		switch (reprap.GetMove().GetKinematics().GetKinematicsType())
 		{
-			requestedSpeed = maxSpeed/xyFactor;
-		}
+		case KinematicsType::cartesian:
+			// On a Cartesian printer the axes accelerate independently
+			break;
 
-		const float maxAcceleration = normalAccelerations[X_AXIS];
-		if (acceleration * xyFactor > maxAcceleration)
-		{
-			acceleration = maxAcceleration/xyFactor;
+		case KinematicsType::coreXY:
+		case KinematicsType::coreXYU:
+			// Preferably we would specialise these, but for now fall through to the default implementation
+		default:
+			// On other types of printer, the relationship between motor movement and head movement is complex.
+			// Limit all moves to the lower of X and Y speeds and accelerations.
+			{
+				const float xyFactor = sqrtf(fsquare(normalisedDirectionVector[X_AXIS]) + fsquare(normalisedDirectionVector[Y_AXIS]));
+				const float * const maxSpeeds = reprap.GetPlatform().MaxFeedrates();
+				const float maxSpeed = min<float>(maxSpeeds[X_AXIS], maxSpeeds[Y_AXIS]);
+				if (requestedSpeed * xyFactor > maxSpeed)
+				{
+					requestedSpeed = maxSpeed/xyFactor;
+				}
+
+				const float maxAcceleration = min<float>(normalAccelerations[X_AXIS], normalAccelerations[Y_AXIS]);
+				if (acceleration * xyFactor > maxAcceleration)
+				{
+					acceleration = maxAcceleration/xyFactor;
+				}
+			}
+			break;
 		}
 	}
 
@@ -392,6 +447,86 @@ bool DDA::Init(const GCodes::RawMove &nextMove, bool doMotorMapping)
 		DoLookahead(prev);
 		startSpeed = prev->targetNextSpeed;
 	}
+
+	RecalculateMove();
+	state = provisional;
+	return true;
+}
+
+// Set up a raw (unmapped) motor move returning true if the move does anything
+bool DDA::Init(const float_t adjustments[DRIVES])
+{
+	// 1. Compute the new endpoints and the movement vector
+	const float ZAcceleration = reprap.GetPlatform().Accelerations()[Z_AXIS];
+	const float ZSpeed = reprap.GetPlatform().MaxFeedrate(Z_AXIS);
+
+	float accelerations[DRIVES];
+	float maxSpeeds[DRIVES];
+	bool realMove = false;
+
+	for (size_t drive = 0; drive < DRIVES; drive++)
+	{
+		accelerations[drive] = ZAcceleration;					// all motors moving are Z motors
+		maxSpeeds[drive] = ZSpeed;								// all motors moving are Z motors
+		endPoint[drive] = prev->endPoint[drive];				// adjusting leadscrews doesn't change the endpoint
+		endCoordinates[drive] = prev->endCoordinates[drive];	// adjusting leadscrews doesn't change the position
+
+		directionVector[drive] = adjustments[drive];
+		const int32_t delta = lrintf(directionVector[drive] * reprap.GetPlatform().DriveStepsPerUnit(Z_AXIS));
+
+		if (delta != 0)
+		{
+			DriveMovement*& pdm = pddm[drive];
+			pdm = DriveMovement::Allocate(drive + DRIVES, DMState::moving);
+			pdm->totalSteps = labs(delta);
+			pdm->direction = (delta >= 0);
+			realMove = true;
+		}
+	}
+
+	// 2. Throw it away if there's no real movement.
+	if (!realMove)
+	{
+		ReleaseDMs();
+		return false;
+	}
+
+	// 3. Store some values
+	isLeadscrewAdjustmentMove = true;
+	isDeltaMovement = false;
+	isPrintingMove = false;
+	xyMoving = false;
+	endStopsToCheck = 0;
+	canPauseBefore = true;
+	canPauseAfter = true;
+	usePressureAdvance = false;
+	virtualExtruderPosition = prev->virtualExtruderPosition;
+	hadLookaheadUnderrun = false;
+	xAxes = prev->xAxes;
+	yAxes = prev->yAxes;
+	filePos = prev->filePos;
+	endCoordinatesValid = prev->endCoordinatesValid;
+	goingSlow = false;
+
+#if SUPPORT_IOBITS
+	ioBits = prev->ioBits;
+#endif
+
+	// 4. Normalise the direction vector and compute the amount of motion.
+	// Currently we normalise the vector sum of all Z motor movement to unit length.
+	totalDistance = Normalise(directionVector, DRIVES, DRIVES);
+
+	// 5. Compute the maximum acceleration available
+	float normalisedDirectionVector[DRIVES];			// Used to hold a unit-length vector in the direction of motion
+	memcpy(normalisedDirectionVector, directionVector, sizeof(normalisedDirectionVector));
+	Absolute(normalisedDirectionVector, DRIVES);
+	acceleration = VectorBoxIntersection(normalisedDirectionVector, accelerations, DRIVES);
+
+	// 6. Set the speed to the smaller of the requested and maximum speed.
+	requestedSpeed = VectorBoxIntersection(normalisedDirectionVector, maxSpeeds, DRIVES);
+
+	// 7. Calculate the provisional accelerate and decelerate distances and the top speed
+	startSpeed = endSpeed = 0.0;
 
 	RecalculateMove();
 	state = provisional;
@@ -527,14 +662,25 @@ float DDA::AdvanceBabyStepping(float amount)
 		float babySteppingToDo = 0.0;
 		if (amount != 0.0 && cdda->xyMoving)
 		{
-			// Limit the babystepping Z speed to the lower of 0.1 times the original XYZ speed and 0.5 times the Z jerk
-			const float maxBabySteppingAmount = cdda->totalDistance * min<float>(0.1, 0.5 * reprap.GetPlatform().ConfiguredInstantDv(Z_AXIS)/cdda->topSpeed);
-			babySteppingToDo = constrain<float>(amount, -maxBabySteppingAmount, maxBabySteppingAmount);
-			cdda->directionVector[Z_AXIS] += babySteppingToDo/cdda->totalDistance;
-			cdda->totalDistance *= cdda->NormaliseXYZ();
-			cdda->RecalculateMove();
-			babySteppingDone += babySteppingToDo;
-			amount -= babySteppingToDo;
+			// If not on a delta printer, check that we have a DM for the Z axis
+			bool ok = (cdda->isDeltaMovement || cdda->pddm[Z_AXIS] != nullptr);
+			if (!ok)
+			{
+				cdda->pddm[Z_AXIS] = DriveMovement::Allocate(Z_AXIS, DMState::idle);
+				ok = (cdda->pddm[Z_AXIS] != nullptr);
+			}
+
+			if (ok)
+			{
+				// Limit the babystepping Z speed to the lower of 0.1 times the original XYZ speed and 0.5 times the Z jerk
+				const float maxBabySteppingAmount = cdda->totalDistance * min<float>(0.1, 0.5 * reprap.GetPlatform().ConfiguredInstantDv(Z_AXIS)/cdda->topSpeed);
+				babySteppingToDo = constrain<float>(amount, -maxBabySteppingAmount, maxBabySteppingAmount);
+				cdda->directionVector[Z_AXIS] += babySteppingToDo/cdda->totalDistance;
+				cdda->totalDistance *= cdda->NormaliseXYZ();
+				cdda->RecalculateMove();
+				babySteppingDone += babySteppingToDo;
+				amount -= babySteppingToDo;
+			}
 		}
 
 		// Even if there is no babystepping to do this move, we may need to adjust the end coordinates
@@ -547,24 +693,27 @@ float DDA::AdvanceBabyStepping(float amount)
 				if (babySteppingToDo != 0.0)
 				{
 					int32_t steps = (int32_t)(babySteppingToDo * reprap.GetPlatform().DriveStepsPerUnit(tower));
-					DriveMovement& dm = cdda->ddm[tower];
-					if (dm.direction)		// if moving up
+					DriveMovement* const pdm = cdda->pddm[tower];
+					if (pdm != nullptr)
 					{
-						steps += (int32_t)dm.totalSteps;
-					}
-					else
-					{
-						steps -= (int32_t)dm.totalSteps;
-					}
-					if (steps >= 0)
-					{
-						dm.direction = true;
-						dm.totalSteps = (uint32_t)steps;
-					}
-					else
-					{
-						dm.direction = false;
-						dm.totalSteps = (uint32_t)(-steps);
+						if (pdm->direction)		// if moving up
+						{
+							steps += (int32_t)pdm->totalSteps;
+						}
+						else
+						{
+							steps -= (int32_t)pdm->totalSteps;
+						}
+						if (steps >= 0)
+						{
+							pdm->direction = true;
+							pdm->totalSteps = (uint32_t)steps;
+						}
+						else
+						{
+							pdm->direction = false;
+							pdm->totalSteps = (uint32_t)(-steps);
+						}
 					}
 				}
 			}
@@ -575,31 +724,35 @@ float DDA::AdvanceBabyStepping(float amount)
 			if (babySteppingToDo != 0.0)
 			{
 				int32_t steps = (int32_t)(babySteppingToDo * reprap.GetPlatform().DriveStepsPerUnit(Z_AXIS));
-				DriveMovement& dm = cdda->ddm[Z_AXIS];
-				if (dm.state == DMState::moving)
+				DriveMovement* const pdm = cdda->pddm[Z_AXIS];			// must be non-null because we allocated one earlier if necessary
+				if (pdm->state == DMState::moving)
 				{
-					if (dm.direction)		// if moving up
+					if (pdm->direction)		// if moving up
 					{
-						steps += (int32_t)dm.totalSteps;
+						steps += (int32_t)pdm->totalSteps;
 					}
 					else
 					{
-						steps -= (int32_t)dm.totalSteps;
+						steps -= (int32_t)pdm->totalSteps;
 					}
 				}
 				else
 				{
-					dm.state = DMState::moving;
+					pdm->state = DMState::moving;
 				}
-				if (steps >= 0)
+
+				if (pdm != nullptr)
 				{
-					dm.direction = true;
-					dm.totalSteps = (uint32_t)steps;
-				}
-				else
-				{
-					dm.direction = false;
-					dm.totalSteps = (uint32_t)(-steps);
+					if (steps >= 0)
+					{
+						pdm->direction = true;
+						pdm->totalSteps = (uint32_t)steps;
+					}
+					else
+					{
+						pdm->direction = false;
+						pdm->totalSteps = (uint32_t)(-steps);
+					}
 				}
 			}
 		}
@@ -662,7 +815,7 @@ void DDA::RecalculateMove()
 		const Platform& p = reprap.GetPlatform();
 		for (size_t drive = 0; drive < DRIVES; ++drive)
 		{
-			if (ddm[drive].state == DMState::moving && endSpeed * fabsf(directionVector[drive]) > p.ActualInstantDv(drive))
+			if (pddm[drive] != nullptr && pddm[drive]->state == DMState::moving && endSpeed * fabsf(directionVector[drive]) > p.ActualInstantDv(drive))
 			{
 				canPauseAfter = false;
 				break;
@@ -684,12 +837,12 @@ void DDA::CalcNewSpeeds()
 		limited = false;
 		for (size_t drive = 0; drive < DRIVES; ++drive)
 		{
-			const float thisMoveFraction = directionVector[drive];
-			const float nextMoveFraction = next->directionVector[drive];
-			const DriveMovement& thisMoveDm = ddm[drive];
-			const DriveMovement& nextMoveDm = next->ddm[drive];
-			if (thisMoveDm.state == DMState::moving || nextMoveDm.state == DMState::moving)
+			if (   (pddm[drive] != nullptr && pddm[drive]->state == DMState::moving)
+				|| (next->pddm[drive] != nullptr && next->pddm[drive]->state == DMState::moving)
+			   )
 			{
+				const float thisMoveFraction = directionVector[drive];
+				const float nextMoveFraction = next->directionVector[drive];
 				const float thisMoveSpeed = endSpeed * thisMoveFraction;
 				const float nextMoveSpeed = targetNextSpeed * nextMoveFraction;
 				const float idealDeltaV = fabsf(thisMoveSpeed - nextMoveSpeed);
@@ -774,10 +927,10 @@ void DDA::SetPositions(const float move[DRIVES], size_t numDrives)
 }
 
 // Get a Cartesian end coordinate from this move
-float DDA::GetEndCoordinate(size_t drive, bool disableDeltaMapping)
+float DDA::GetEndCoordinate(size_t drive, bool disableMotorMapping)
 pre(disableDeltaMapping || drive < MaxAxes)
 {
-	if (disableDeltaMapping)
+	if (disableMotorMapping)
 	{
 		return Move::MotorEndpointToPosition(endPoint[drive], drive);
 	}
@@ -826,60 +979,63 @@ void DDA::Prepare()
 			const float A = initialX - dparams.GetTowerX(drive);
 			const float B = initialY - dparams.GetTowerY(drive);
 			const float stepsPerMm = reprap.GetPlatform().DriveStepsPerUnit(drive);
-			DriveMovement& dm = ddm[drive];
-			const float aAplusbB = A * directionVector[X_AXIS] + B * directionVector[Y_AXIS];
-			const float dSquaredMinusAsquaredMinusBsquared = diagonalSquared - fsquare(A) - fsquare(B);
-			const float h0MinusZ0 = sqrtf(dSquaredMinusAsquaredMinusBsquared);
-			dm.mp.delta.hmz0sK = (int32_t)(h0MinusZ0 * stepsPerMm * DriveMovement::K2);
-			dm.mp.delta.minusAaPlusBbTimesKs = -(int32_t)(aAplusbB * stepsPerMm * DriveMovement::K2);
-			dm.mp.delta.dSquaredMinusAsquaredMinusBsquaredTimesKsquaredSsquared =
-					(int64_t)(dSquaredMinusAsquaredMinusBsquared * fsquare(stepsPerMm * DriveMovement::K2));
+			DriveMovement* const pdm = pddm[drive];
+			if (pdm != nullptr)
+			{
+				const float aAplusbB = A * directionVector[X_AXIS] + B * directionVector[Y_AXIS];
+				const float dSquaredMinusAsquaredMinusBsquared = diagonalSquared - fsquare(A) - fsquare(B);
+				const float h0MinusZ0 = sqrtf(dSquaredMinusAsquaredMinusBsquared);
+				pdm->mp.delta.hmz0sK = (int32_t)(h0MinusZ0 * stepsPerMm * DriveMovement::K2);
+				pdm->mp.delta.minusAaPlusBbTimesKs = -(int32_t)(aAplusbB * stepsPerMm * DriveMovement::K2);
+				pdm->mp.delta.dSquaredMinusAsquaredMinusBsquaredTimesKsquaredSsquared =
+						(int64_t)(dSquaredMinusAsquaredMinusBsquared * fsquare(stepsPerMm * DriveMovement::K2));
 
-			// Calculate the distance at which we need to reverse direction.
-			if (a2plusb2 <= 0.0)
-			{
-				// Pure Z movement. We can't use the main calculation because it divides by a2plusb2.
-				dm.direction = (directionVector[Z_AXIS] >= 0.0);
-				dm.reverseStartStep = dm.totalSteps + 1;
-			}
-			else
-			{
-				// The distance to reversal is the solution to a quadratic equation. One root corresponds to the carriages being below the bed,
-				// the other root corresponds to the carriages being above the bed.
-				const float drev = ((directionVector[Z_AXIS] * sqrt(a2b2D2 - fsquare(A * directionVector[Y_AXIS] - B * directionVector[X_AXIS])))
-									- aAplusbB)/a2plusb2;
-				if (drev > 0.0 && drev < totalDistance)		// if the reversal point is within range
+				// Calculate the distance at which we need to reverse direction.
+				if (a2plusb2 <= 0.0)
 				{
-					// Calculate how many steps we need to move up before reversing
-					const float hrev = directionVector[Z_AXIS] * drev + sqrt(dSquaredMinusAsquaredMinusBsquared - 2 * drev * aAplusbB - a2plusb2 * fsquare(drev));
-					const int32_t numStepsUp = (int32_t)((hrev - h0MinusZ0) * stepsPerMm);
-
-					// We may be almost at the peak height already, in which case we don't really have a reversal.
-					if (numStepsUp < 1 || (dm.direction && (uint32_t)numStepsUp <= dm.totalSteps))
-					{
-						dm.reverseStartStep = dm.totalSteps + 1;
-					}
-					else
-					{
-						dm.reverseStartStep = (uint32_t)numStepsUp + 1;
-
-						// Correct the initial direction and the total number of steps
-						if (dm.direction)
-						{
-							// Net movement is up, so we will go up a bit and then down by a lesser amount
-							dm.totalSteps = (2 * numStepsUp) - dm.totalSteps;
-						}
-						else
-						{
-							// Net movement is down, so we will go up first and then down by a greater amount
-							dm.direction = true;
-							dm.totalSteps = (2 * numStepsUp) + dm.totalSteps;
-						}
-					}
+					// Pure Z movement. We can't use the main calculation because it divides by a2plusb2.
+					pdm->direction = (directionVector[Z_AXIS] >= 0.0);
+					pdm->reverseStartStep = pdm->totalSteps + 1;
 				}
 				else
 				{
-					dm.reverseStartStep = dm.totalSteps + 1;
+					// The distance to reversal is the solution to a quadratic equation. One root corresponds to the carriages being below the bed,
+					// the other root corresponds to the carriages being above the bed.
+					const float drev = ((directionVector[Z_AXIS] * sqrt(a2b2D2 - fsquare(A * directionVector[Y_AXIS] - B * directionVector[X_AXIS])))
+										- aAplusbB)/a2plusb2;
+					if (drev > 0.0 && drev < totalDistance)		// if the reversal point is within range
+					{
+						// Calculate how many steps we need to move up before reversing
+						const float hrev = directionVector[Z_AXIS] * drev + sqrt(dSquaredMinusAsquaredMinusBsquared - 2 * drev * aAplusbB - a2plusb2 * fsquare(drev));
+						const int32_t numStepsUp = (int32_t)((hrev - h0MinusZ0) * stepsPerMm);
+
+						// We may be almost at the peak height already, in which case we don't really have a reversal.
+						if (numStepsUp < 1 || (pdm->direction && (uint32_t)numStepsUp <= pdm->totalSteps))
+						{
+							pdm->reverseStartStep = pdm->totalSteps + 1;
+						}
+						else
+						{
+							pdm->reverseStartStep = (uint32_t)numStepsUp + 1;
+
+							// Correct the initial direction and the total number of steps
+							if (pdm->direction)
+							{
+								// Net movement is up, so we will go up a bit and then down by a lesser amount
+								pdm->totalSteps = (2 * numStepsUp) - pdm->totalSteps;
+							}
+							else
+							{
+								// Net movement is down, so we will go up first and then down by a greater amount
+								pdm->direction = true;
+								pdm->totalSteps = (2 * numStepsUp) + pdm->totalSteps;
+							}
+						}
+					}
+					else
+					{
+						pdm->reverseStartStep = pdm->totalSteps + 1;
+					}
 				}
 			}
 		}
@@ -902,69 +1058,81 @@ void DDA::Prepare()
 	params.accelClocksMinusAccelDistanceTimesCdivTopSpeed = (uint32_t)((accelStopTime - (accelDistance/topSpeed)) * stepClockRate);
 	params.compFactor = 1.0 - startSpeed/topSpeed;
 
-	goingSlow = false;
 	firstDM = nullptr;
 
 	const size_t numAxes = reprap.GetGCodes().GetTotalAxes();
 	for (size_t drive = 0; drive < DRIVES; ++drive)
 	{
-		DriveMovement& dm = ddm[drive];
-		if (dm.state == DMState::moving)
+		DriveMovement* const pdm = pddm[drive];
+		if (pddm != nullptr && pdm->state == DMState::moving)
 		{
-			dm.drive = drive;
-			reprap.GetPlatform().EnableDrive(drive);
-			if (drive >= numAxes)
+			if (isLeadscrewAdjustmentMove)
 			{
-				dm.PrepareExtruder(*this, params, usePressureAdvance);
+				reprap.GetPlatform().EnableDrive(Z_AXIS);			// ensure all Z motors are enabled
+				pdm->PrepareCartesianAxis(*this, params);
 
 				// Check for sensible values, print them if they look dubious
-				if (reprap.Debug(moduleDda)
-					&& (   dm.totalSteps > 1000000
-						|| dm.reverseStartStep < dm.mp.cart.decelStartStep
-						|| (dm.reverseStartStep <= dm.totalSteps
-							&& dm.mp.cart.fourMaxStepDistanceMinusTwoDistanceToStopTimesCsquaredDivA > (int64_t)(dm.mp.cart.twoCsquaredTimesMmPerStepDivA * dm.reverseStartStep))
-					   )
-				   )
-				{
-					DebugPrint();
-				}
-			}
-			else if (isDeltaMovement && drive < DELTA_AXES)			// for now, additional axes are assumed to be not part of the delta mechanism
-			{
-				dm.PrepareDeltaAxis(*this, params);
-
-				// Check for sensible values, print them if they look dubious
-				if (reprap.Debug(moduleDda) && dm.totalSteps > 1000000)
+				if (reprap.Debug(moduleDda) && pdm->totalSteps > 1000000)
 				{
 					DebugPrint();
 				}
 			}
 			else
 			{
-				dm.PrepareCartesianAxis(*this, params);
-
-				// Check for sensible values, print them if they look dubious
-				if (reprap.Debug(moduleDda) && dm.totalSteps > 1000000)
+				reprap.GetPlatform().EnableDrive(drive);
+				if (drive >= numAxes)
 				{
-					DebugPrint();
+					pdm->PrepareExtruder(*this, params, usePressureAdvance);
+
+					// Check for sensible values, print them if they look dubious
+					if (reprap.Debug(moduleDda)
+						&& (   pdm->totalSteps > 1000000
+							|| pdm->reverseStartStep < pdm->mp.cart.decelStartStep
+							|| (pdm->reverseStartStep <= pdm->totalSteps
+								&& pdm->mp.cart.fourMaxStepDistanceMinusTwoDistanceToStopTimesCsquaredDivA > (int64_t)(pdm->mp.cart.twoCsquaredTimesMmPerStepDivA * pdm->reverseStartStep))
+						   )
+					   )
+					{
+						DebugPrint();
+					}
+				}
+				else if (isDeltaMovement && drive < DELTA_AXES)			// for now, additional axes are assumed to be not part of the delta mechanism
+				{
+					pdm->PrepareDeltaAxis(*this, params);
+
+					// Check for sensible values, print them if they look dubious
+					if (reprap.Debug(moduleDda) && pdm->totalSteps > 1000000)
+					{
+						DebugPrint();
+					}
+				}
+				else
+				{
+					pdm->PrepareCartesianAxis(*this, params);
+
+					// Check for sensible values, print them if they look dubious
+					if (reprap.Debug(moduleDda) && pdm->totalSteps > 1000000)
+					{
+						DebugPrint();
+					}
 				}
 			}
 
 			// Prepare for the first step
-			dm.nextStep = 0;
-			dm.nextStepTime = 0;
-			dm.stepInterval = 999999;						// initialise to a large value so that we will calculate the time for just one step
-			dm.stepsTillRecalc = 0;							// so that we don't skip the calculation
+			pdm->nextStep = 0;
+			pdm->nextStepTime = 0;
+			pdm->stepInterval = 999999;						// initialise to a large value so that we will calculate the time for just one step
+			pdm->stepsTillRecalc = 0;							// so that we don't skip the calculation
 			const bool stepsToDo = (isDeltaMovement && drive < numAxes)
-									? dm.CalcNextStepTimeDelta(*this, false)
-									: dm.CalcNextStepTimeCartesian(*this, false);
+									? pdm->CalcNextStepTimeDelta(*this, false)
+									: pdm->CalcNextStepTimeCartesian(*this, false);
 			if (stepsToDo)
 			{
-				InsertDM(&dm);
+				InsertDM(pdm);
 			}
 			else
 			{
-				dm.state = DMState::idle;
+				pdm->state = DMState::idle;
 			}
 		}
 	}
@@ -1025,21 +1193,30 @@ void DDA::Prepare()
 float DDA::NormaliseXYZ()
 {
 	// First calculate the magnitude of the vector. If there is more than one X axis, take an average of their movements (they should be equal).
-	float magSquared = 0.0;
-	unsigned int numXaxes = 0;
+	float xMagSquared = 0.0, yMagSquared = 0.0;
+	unsigned int numXaxes = 0, numYaxes = 0;
 	for (size_t d = 0; d < MaxAxes; ++d)
 	{
 		if (((1 << d) & xAxes) != 0)
 		{
-			magSquared += fsquare(directionVector[d]);
+			xMagSquared += fsquare(directionVector[d]);
 			++numXaxes;
 		}
+		if (((1 << d) & yAxes) != 0)
+		{
+			yMagSquared += fsquare(directionVector[d]);
+			++numYaxes;
+		}
 	}
-	if (numXaxes != 0)
+	if (numXaxes > 1)
 	{
-		magSquared /= numXaxes;
+		xMagSquared /= numXaxes;
 	}
-	const float magnitude = sqrtf(magSquared + fsquare(directionVector[Y_AXIS]) + fsquare(directionVector[Z_AXIS]));
+	if (numYaxes > 1)
+	{
+		yMagSquared /= numYaxes;
+	}
+	const float magnitude = sqrtf(xMagSquared + yMagSquared + fsquare(directionVector[Z_AXIS]));
 	if (magnitude <= 0.0)
 	{
 		return 0.0;
@@ -1089,7 +1266,7 @@ void DDA::CheckEndstops(Platform& platform)
 		{
 		case EndStopHit::lowHit:
 			MoveAborted();											// set the state to completed and recalculate the endpoints
-			reprap.GetMove().ZProbeTriggered(this);
+			reprap.GetGCodes().MoveStoppedByZProbe();
 			break;
 
 		case EndStopHit::lowNear:
@@ -1132,42 +1309,36 @@ void DDA::CheckEndstops(Platform& platform)
 	const size_t numAxes = reprap.GetGCodes().GetTotalAxes();
 	for (size_t drive = 0; drive < numAxes; ++drive)
 	{
-		if ((endStopsToCheck & (1 << drive)) != 0)
+		if (IsBitSet(endStopsToCheck, drive))
 		{
-			switch(platform.Stopped(drive))
+			const EndStopHit esh = platform.Stopped(drive);
+			switch (esh)
 			{
 			case EndStopHit::lowHit:
-				endStopsToCheck &= ~(1 << drive);					// clear this check so that we can check for more
-				if (endStopsToCheck == 0 || reprap.GetMove().GetKinematics().DriveIsShared(drive))
-				{
-					// No more endstops to check, or this axis uses shared motors, so stop the entire move
-					MoveAborted();
-				}
-				else
-				{
-					StopDrive(drive);
-				}
-				reprap.GetMove().HitLowStop(drive, this);
-				break;
-
 			case EndStopHit::highHit:
-				endStopsToCheck &= ~(1 << drive);					// clear this check so that we can check for more
-				if (endStopsToCheck == 0 || reprap.GetMove().GetKinematics().DriveIsShared(drive))
 				{
-					// No more endstops to check, or this axis uses shared motors, so stop the entire move
-					MoveAborted();
+					ClearBit(endStopsToCheck, drive);					// clear this check so that we can check for more
+					StopDrive(drive);									// we must stop the drive before we mess with its coordinates
+					bool stopAll = (endStopsToCheck == 0);
+					if (drive < reprap.GetGCodes().GetTotalAxes() && IsHomingAxes())
+					{
+						if (reprap.GetMove().GetKinematics().OnHomingSwitchTriggered(drive, esh == EndStopHit::highHit, reprap.GetPlatform().GetDriveStepsPerUnit(), *this))
+						{
+							stopAll = true;
+						}
+						reprap.GetGCodes().SetAxisIsHomed(drive);
+					}
+					if (stopAll)
+					{
+						MoveAborted();									// no more endstops to check, or this axis uses shared motors, so stop the entire move
+					}
 				}
-				else
-				{
-					StopDrive(drive);
-				}
-				reprap.GetMove().HitHighStop(drive, this);
 				break;
 
 			case EndStopHit::lowNear:
 				// Only reduce homing speed if there are no more axes to be homed.
 				// This allows us to home X and Y simultaneously.
-				if (endStopsToCheck == (1 << drive))
+				if (endStopsToCheck == MakeBitmap<AxesBitmap>(drive))
 				{
 					ReduceHomingSpeed();
 				}
@@ -1205,13 +1376,14 @@ pre(state == frozen)
 		const size_t numAxes = reprap.GetGCodes().GetTotalAxes();
 		for (size_t i = 0; i < DRIVES; ++i)
 		{
-			DriveMovement& dm = ddm[i];
-			if (dm.state == DMState::moving)
+			DriveMovement* const pdm = pddm[i];
+			if (pdm != nullptr && pdm->state == DMState::moving)
 			{
-				reprap.GetPlatform().SetDirection(i, dm.direction);
-				if (i >= numAxes)
+				const size_t drive = pdm->drive;
+				reprap.GetPlatform().SetDirection(drive, pdm->direction);
+				if (drive >= numAxes && drive < DRIVES)
 				{
-					if (dm.direction == FORWARDS)
+					if (pdm->direction == FORWARDS)
 					{
 						extrusions |= (1 << (i - numAxes));
 					}
@@ -1229,8 +1401,9 @@ pre(state == frozen)
 			const unsigned int prohibitedMovements = reprap.GetProhibitedExtruderMovements(extrusions, retractions);
 			for (DriveMovement **dmpp = &firstDM; *dmpp != nullptr; )
 			{
-				bool thisDriveExtruding = (*dmpp)->drive >= numAxes;
-				if (thisDriveExtruding && (prohibitedMovements & (1 << ((*dmpp)->drive - numAxes))) != 0)
+				const size_t drive = (*dmpp)->drive;
+				const bool thisDriveExtruding = drive >= numAxes && drive < DRIVES;
+				if (thisDriveExtruding && (prohibitedMovements & (1 << (drive - numAxes))) != 0)
 				{
 					*dmpp = (*dmpp)->nextDM;
 				}
@@ -1254,7 +1427,7 @@ pre(state == frozen)
 
 		if (firstDM != nullptr)
 		{
-			return platform.ScheduleInterrupt(firstDM->nextStepTime + moveStartTime);
+			return platform.ScheduleStepInterrupt(firstDM->nextStepTime + moveStartTime);
 		}
 	}
 
@@ -1267,6 +1440,7 @@ extern uint32_t maxReps;
 // This is called by the interrupt service routine to execute steps.
 // It returns true if it needs to be called again on the DDA of the new current move, otherwise false.
 // This must be as fast as possible, because it determines the maximum movement speed.
+// This may occasionally get called prematurely, so it must check that a step is actually due before generating one.
 bool DDA::Step()
 {
 	Platform& platform = reprap.GetPlatform();
@@ -1352,7 +1526,7 @@ bool DDA::Step()
 		}
 
 		// 7. Schedule next interrupt, or if it would be too soon, generate more steps immediately
-		repeat = platform.ScheduleInterrupt(firstDM->nextStepTime + moveStartTime);
+		repeat = platform.ScheduleStepInterrupt(firstDM->nextStepTime + moveStartTime);
 	} while (repeat);
 
 	if (numReps > maxReps)
@@ -1373,11 +1547,11 @@ bool DDA::Step()
 // Stop a drive and re-calculate the corresponding endpoint
 void DDA::StopDrive(size_t drive)
 {
-	DriveMovement& dm = ddm[drive];
-	if (dm.state == DMState::moving)
+	DriveMovement* const pdm = pddm[drive];
+	if (pdm->state == DMState::moving)
 	{
-		endPoint[drive] -= dm.GetNetStepsLeft();
-		dm.state = DMState::idle;
+		endPoint[drive] -= pdm->GetNetStepsLeft();
+		pdm->state = DMState::idle;
 		if (drive < reprap.GetGCodes().GetTotalAxes())
 		{
 			endCoordinatesValid = false;			// the XYZ position is no longer valid
@@ -1394,9 +1568,12 @@ void DDA::StopDrive(size_t drive)
 // It adjusts the end points of the current move to account for how far through the move we got.
 void DDA::MoveAborted()
 {
-	for (size_t drive = 0; drive < DRIVES; ++drive)
+	if (state == executing)
 	{
-		StopDrive(drive);
+		for (size_t drive = 0; drive < DRIVES; ++drive)
+		{
+			StopDrive(drive);
+		}
 	}
 	state = completed;
 }
@@ -1413,12 +1590,12 @@ void DDA::ReduceHomingSpeed()
 		topSpeed /= factor;
 		for (size_t drive = 0; drive < DRIVES; ++drive)
 		{
-			DriveMovement& dm = ddm[drive];
-			if (dm.state == DMState::moving)
+			DriveMovement* const pdm = pddm[drive];
+			if (pdm->state == DMState::moving)
 			{
-				dm.ReduceSpeed(*this, factor);
-				RemoveDM(dm.drive);
-				InsertDM(&dm);
+				pdm->ReduceSpeed(*this, factor);
+				RemoveDM(pdm->drive);
+				InsertDM(pdm);
 			}
 		}
 
@@ -1436,13 +1613,21 @@ bool DDA::HasStepError() const
 {
 	for (size_t drive = 0; drive < DRIVES; ++drive)
 	{
-		const DriveMovement& dm = ddm[drive];
-		if (dm.state == DMState::stepError)
+		const DriveMovement* const pdm = pddm[drive];
+		if (pdm != nullptr && pdm->state == DMState::stepError)
 		{
 			return true;
 		}
 	}
 	return false;
+}
+
+// Free up this DDA, returning true if the lookahead underrun flag was set
+bool DDA::Free()
+{
+	ReleaseDMs();
+	state = empty;
+	return hadLookaheadUnderrun;
 }
 
 // End

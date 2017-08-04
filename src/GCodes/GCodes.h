@@ -30,24 +30,22 @@ Licence: GPL
 #include "Tools/Filament.h"
 #include "RestorePoint.h"
 
-class GCodeBuffer;
-class GCodeQueue;
-
 const char feedrateLetter = 'F';						// GCode feedrate
 const char extrudeLetter = 'E'; 						// GCode extrude
 
 // Type for specifying which endstops we want to check
-typedef uint16_t EndstopChecks;							// must be large enough to hold a bitmap of drive numbers or ZProbeActive
-const EndstopChecks ZProbeActive = 1 << 15;				// must be distinct from 1 << (any drive number)
-const EndstopChecks LogProbeChanges = 1 << 14;			// must be distinct from 1 << (any drive number)
-const EndstopChecks HomeAxes = 1 << 13;					// must be distinct from 1 << (any drive number)
+typedef AxesBitmap EndstopChecks;						// must be large enough to hold a bitmap of drive numbers or ZProbeActive
+const EndstopChecks ZProbeActive = 1 << 31;				// must be distinct from 1 << (any drive number)
+const EndstopChecks HomeAxes = 1 << 30;					// must be distinct from 1 << (any drive number)
+const EndstopChecks LogProbeChanges = 1 << 29;			// must be distinct from 1 << (any drive number)
 
-typedef uint16_t TriggerMask;
+typedef uint32_t TriggerInputsBitmap;					// Bitmap of input pins that a single trigger number responds to
+typedef uint32_t TriggerNumbersBitmap;					// Bitmap of trigger numbers
 
 struct Trigger
 {
-	TriggerMask rising;
-	TriggerMask falling;
+	TriggerInputsBitmap rising;
+	TriggerInputsBitmap falling;
 	uint8_t condition;
 
 	void Init()
@@ -62,7 +60,7 @@ struct Trigger
 	}
 };
 
-// Bits for T-code P-parameter to specify which macros are supposted to be run
+// Bits for T-code P-parameter to specify which macros are supposed to be run
 const int TFreeBit = 1 << 0;
 const int TPreBit = 1 << 1;
 const int TPostBit = 1 << 2;
@@ -80,8 +78,10 @@ public:
 		float coords[DRIVES];											// new positions for the axes, amount of movement for the extruders
 		float initialCoords[MaxAxes];									// the initial positions of the axes
 		float feedRate;													// feed rate of this move
-		FilePosition filePos;											// offset in the file being printed at the end of reading this move
-		uint32_t xAxes;													// axes that X is mapped to
+		float virtualExtruderPosition;									// the virtual extruder position of the current tool at the start of this move
+		FilePosition filePos;											// offset in the file being printed at the start of reading this move
+		AxesBitmap xAxes;												// axes that X is mapped to
+		AxesBitmap yAxes;												// axes that Y is mapped to
 		EndstopChecks endStopsToCheck;									// endstops to check
 #if SUPPORT_IOBITS
 		IoBits_t ioBits;												// I/O bits to set/clear at the start of this move
@@ -89,6 +89,7 @@ public:
 		uint8_t moveType;												// the S parameter from the G0 or G1 command, 0 for a normal move
 		bool isFirmwareRetraction;										// true if this is a firmware retraction/un-retraction move
 		bool usePressureAdvance;										// true if we want to us extruder pressure advance, if there is any extrusion
+		bool canPauseBefore;											// true if we can pause before this move
 		bool canPauseAfter;												// true if we can pause just after this move and successfully restart
 		bool hasExtrusion;												// true if the move includes extrusion - only valid if the move was set up by SetupMove
 	};
@@ -111,11 +112,11 @@ public:
 	bool IsDaemonBusy() const;											// Return true if the daemon is busy running config.g or a trigger file
 
 	bool GetAxisIsHomed(unsigned int axis) const						// Has the axis been homed?
-		{ return (axesHomed & (1 << axis)) != 0; }
+		{ return IsBitSet(axesHomed, axis); }
 	void SetAxisIsHomed(unsigned int axis)								// Tell us that the axis is now homed
-		{ axesHomed |= (1 << axis); }
+		{ SetBit(axesHomed, axis); }
 	void SetAxisNotHomed(unsigned int axis)								// Tell us that the axis is not homed
-		{ axesHomed &= ~(1 << axis); }
+		{ ClearBit(axesHomed, axis); }
 
 	float GetSpeedFactor() const { return speedFactor * MinutesToSeconds; }	// Return the current speed factor
 	float GetExtrusionFactor(size_t extruder) { return extrusionFactors[extruder]; } // Return the current extrusion factors
@@ -148,7 +149,14 @@ public:
 	size_t GetVisibleAxes() const { return numVisibleAxes; }
 	size_t GetNumExtruders() const { return numExtruders; }
 
-	static const char axisLetters[MaxAxes]; 							// 'X', 'Y', 'Z'
+#ifdef DUET_NG
+	bool AutoPause();
+	bool AutoShutdown();
+	bool AutoResume();
+	bool AutoResumeAfterShutdown();
+#endif
+
+	static const char axisLetters[MaxAxes];
 
 private:
 	GCodes(const GCodes&);												// private copy constructor to prevent copying
@@ -195,10 +203,11 @@ private:
 	bool ExecuteG30(GCodeBuffer& gb, StringRef& reply);					// Probes at a given position - see the comment at the head of the function itself
 	void SetBedEquationWithProbe(int sParam, StringRef& reply);			// Probes a series of points and sets the bed equation
 	bool SetPrintZProbe(GCodeBuffer& gb, StringRef& reply);				// Either return the probe value, or set its threshold
-	bool SetOrReportOffsets(GCodeBuffer& gb, StringRef& reply);			// Deal with a G10
+	bool SetOrReportOffsets(GCodeBuffer& gb, StringRef& reply, bool& error);	// Deal with a G10
 
 	bool SetPositions(GCodeBuffer& gb);									// Deal with a G92
 	bool LoadExtrusionAndFeedrateFromGCode(GCodeBuffer& gb, int moveType); // Set up the extrusion and feed rate of a move for the Move class
+	float GetVirtualExtruderPosition() const;							// Get the virtual extruder position of the current tool
 
 	bool Push(GCodeBuffer& gb);											// Push feedrate etc on the stack
 	void Pop(GCodeBuffer& gb);											// Pop feedrate etc
@@ -206,12 +215,14 @@ private:
 	void SetMACAddress(GCodeBuffer& gb);								// Deals with an M540
 	void HandleReply(GCodeBuffer& gb, bool error, const char *reply);	// Handle G-Code replies
 	void HandleReply(GCodeBuffer& gb, bool error, OutputBuffer *reply);
-	bool OpenFileToWrite(GCodeBuffer& gb, const char* directory, const char* fileName);	// Start saving GCodes in a file
+	bool OpenFileToWrite(GCodeBuffer& gb, const char* directory, const char* fileName, const FilePosition size, const bool binaryWrite, const uint32_t fileCRC32);
+																		// Start saving GCodes in a file
+	void FinishWrite(GCodeBuffer& gb);									// Finish writing to the file and respond
 	bool SendConfigToLine();											// Deal with M503
 	bool OffsetAxes(GCodeBuffer& gb);									// Set offsets - deprecated, use G10
 	void SetPidParameters(GCodeBuffer& gb, int heater, StringRef& reply); // Set the P/I/D parameters for a heater
 	bool SetHeaterParameters(GCodeBuffer& gb, StringRef& reply);		// Set the thermistor and ADC parameters for a heater, returning true if an error occurs
-	void ManageTool(GCodeBuffer& gb, StringRef& reply);					// Create a new tool definition
+	bool ManageTool(GCodeBuffer& gb, StringRef& reply);					// Create a new tool definition, returning true if an error was reported
 	void SetToolHeaters(Tool *tool, float temperature);					// Set all a tool's heaters to the temperature.  For M104...
 	bool ToolHeatersAtSetTemperatures(const Tool *tool, bool waitWhenCooling) const; // Wait for the heaters associated with the specified tool to reach their set temperatures
 	void GenerateTemperatureReport(StringRef& reply) const;				// Store a standard-format temperature report in reply
@@ -224,18 +235,18 @@ private:
 	void SetAllAxesNotHomed();											// Flag all axes as not homed
 	void SetMachinePosition(const float positionNow[DRIVES], bool doBedCompensation = true); // Set the current position to be this
 	void GetCurrentUserPosition();										// Get the current position form the Move class
-	void ToolOffsetTransform(const float coordsIn[MaxAxes], float coordsOut[MaxAxes], bool mapXAxis);	// Convert user coordinates to head reference point coordinates
+	void ToolOffsetTransform(const float coordsIn[MaxAxes], float coordsOut[MaxAxes]);	// Convert user coordinates to head reference point coordinates
 	void ToolOffsetInverseTransform(const float coordsIn[MaxAxes], float coordsOut[MaxAxes]);	// Convert head reference point coordinates to user coordinates
 	const char *TranslateEndStopResult(EndStopHit es);					// Translate end stop result to text
 	bool RetractFilament(GCodeBuffer& gb, bool retract);				// Retract or un-retract filaments
 	bool LoadFilament(GCodeBuffer& gb, StringRef& reply, bool &error);	// Load the specified filament into a tool
 	bool UnloadFilament(GCodeBuffer& gb, StringRef& reply, bool &error); // Unload the current filament from a tool
 	bool ChangeMicrostepping(size_t drive, int microsteps, int mode) const;	// Change microstepping on the specified drive
-	void ListTriggers(StringRef reply, TriggerMask mask);				// Append a list of trigger endstops to a message
+	void ListTriggers(StringRef reply, TriggerInputsBitmap mask);		// Append a list of trigger inputs to a message
 	void CheckTriggers();												// Check for and execute triggers
 	void DoEmergencyStop();												// Execute an emergency stop
 
-	void DoPause(GCodeBuffer& gb)										// Pause the print
+	void DoPause(GCodeBuffer& gb, bool isAuto)							// Pause the print
 	pre(resourceOwners[movementResource] = &gb);
 
 	void SetMappedFanSpeed();											// Set the speeds of fans mapped for the current tool
@@ -254,7 +265,11 @@ private:
 	MessageType GetMessageBoxDevice(GCodeBuffer& gb) const;				// Decide which device to display a message box on
 	void DoManualProbe(GCodeBuffer& gb);								// Do a manual bed probe
 
-	static uint32_t LongArrayToBitMap(const long *arr, size_t numEntries);	// Convert an array of longs to a bit map
+	void AppendAxes(StringRef& reply, AxesBitmap axes) const;			// Append a list of axes to a string
+
+#ifdef DUET_NG
+	void SaveResumeInfo();
+#endif
 
 	Platform& platform;													// The RepRap machine
 
@@ -264,7 +279,12 @@ private:
 	StreamGCodeInput* serialInput;										// ...
 	StreamGCodeInput* auxInput;											// ...for the GCodeBuffers below
 
+#ifdef DUET_NG
+	GCodeBuffer* gcodeSources[8];										// The various sources of gcodes
+	GCodeBuffer*& autoPauseGCode = gcodeSources[7];						// GCode state machine used to run pause.g and resume.g
+#else
 	GCodeBuffer* gcodeSources[7];										// The various sources of gcodes
+#endif
 
 	GCodeBuffer*& httpGCode = gcodeSources[0];
 	GCodeBuffer*& telnetGCode = gcodeSources[1];
@@ -278,7 +298,12 @@ private:
 	const GCodeBuffer* resourceOwners[NumResources];					// Which gcode buffer owns each resource
 
 	bool active;								// Live and running?
-	bool isPaused;								// true if the print has been paused
+	bool isPaused;								// true if the print has been paused manually or automatically
+	bool pausePending;							// true if we have been asked to pause but we are running a macro
+#ifdef DUET_NG
+	bool isAutoPaused;							// true if the print was paused automatically
+	bool resumeInfoSaved;						// true if we have saved resume info at this pause point
+#endif
 	bool runningConfigFile;						// We are running config.g during the startup process
 	bool doingToolChange;						// We are running tool change macros
 
@@ -292,7 +317,6 @@ private:
 	float arcRadius;
 	float arcCurrentAngle;
 	float arcAngleIncrement;
-	uint32_t arcAxesMoving;
 	bool doingArcMove;
 
 	RestorePoint simulationRestorePoint;		// The position and feed rate when we started a simulation
@@ -309,9 +333,13 @@ private:
 	float record[DRIVES];						// Temporary store for move positions
 	float distanceScale;						// MM or inches
 	float arcSegmentLength;						// Length of segments that we split arc moves into
-	FileData fileToPrint;
+
+	FileData fileToPrint;						// The next file to print
+	FilePosition fileOffsetToPrint;				// The offset to print from
+
 	FileStore* fileBeingWritten;				// A file to write G Codes (or sometimes HTML) to
-	uint16_t toBeHomed;							// Bitmap of axes still to be homed
+	FilePosition fileSize;						// Size of the file being written
+
 	int oldToolNumber, newToolNumber;			// Tools being changed
 	int toolChangeParam;						// Bitmap of all the macros to be run during a tool change
 
@@ -319,21 +347,28 @@ private:
 	uint8_t eofStringCounter;					// Check the...
 	uint8_t eofStringLength;					// ... EoF string as we read.
 	bool limitAxes;								// Don't think outside the box.
-	uint32_t axesHomed;							// Bitmap of which axes have been homed
+
+	AxesBitmap toBeHomed;						// Bitmap of axes still to be homed
+	AxesBitmap axesHomed;						// Bitmap of which axes have been homed
+
 	float pausedFanSpeeds[NUM_FANS];			// Fan speeds when the print was paused or a tool change started
 	float lastDefaultFanSpeed;					// Last speed given in a M106 command with on fan number
 	float pausedDefaultFanSpeed;				// The speed of the default print cooling fan when the print was paused or a tool change started
 	float speedFactor;							// speed factor, including the conversion from mm/min to mm/sec, normally 1/60
 	float extrusionFactors[MaxExtruders];		// extrusion factors (normally 1.0)
+	float volumetricExtrusionFactors[MaxExtruders]; // Volumetric extrusion factors
 	float currentBabyStepZOffset;				// The accumulated Z offset due to baby stepping requests
 
 	// Z probe
 	int32_t g30ProbePointIndex;					// the index of the point we are probing (G30 P parameter), or -1 if none
+	int g30SValue;								// S parameter in the G30 command, or -2 if there wasn't one
 	float lastProbedZ;							// the last height at which the Z probe stopped
+	float zStoppedHeight;						// the height to report after running G30 S-1
 	uint32_t lastProbedTime;					// time in milliseconds that the probe was last triggered
 	volatile bool zProbeTriggered;				// Set by the step ISR when a move is aborted because the Z probe is triggered
 	size_t gridXindex, gridYindex;				// Which grid probe point is next
 	bool doingManualBedProbe;					// true if we are waiting for the user to jog the nozzle until it touches the bed
+	bool probeIsDeployed;						// true if M401 has been used to deploy the probe and M402 has not yet been used t0 retract it
 
 	float simulationTime;						// Accumulated simulation time
 	uint8_t simulationMode;						// 0 = not simulating, 1 = simulating, >1 are simulation modes for debugging
@@ -347,9 +382,9 @@ private:
 
 	// Triggers
 	Trigger triggers[MaxTriggers];				// Trigger conditions
-	TriggerMask lastEndstopStates;				// States of the endstop inputs last time we looked
+	TriggerInputsBitmap lastEndstopStates;		// States of the trigger inputs last time we looked
 	static_assert(MaxTriggers <= 32, "Too many triggers");
-	uint32_t triggersPending;					// Bitmap of triggers pending but not yet executed
+	TriggerNumbersBitmap triggersPending;		// Bitmap of triggers pending but not yet executed
 
 	// Firmware update
 	uint8_t firmwareUpdateModuleMap;			// Bitmap of firmware modules to be updated
@@ -367,13 +402,38 @@ private:
 	// Misc
 	float longWait;								// Timer for things that happen occasionally (seconds)
 	uint32_t lastWarningMillis;					// When we last sent a warning message for things that can happen very often
-	uint16_t axesToSenseLength;					// The axes on which we are performing axis length sensing
+	AxesBitmap axesToSenseLength;				// The axes on which we are performing axis length sensing
 	int8_t lastAuxStatusReportType;				// The type of the last status report requested by PanelDue
 	bool isWaiting;								// True if waiting to reach temperature
 	bool cancelWait;							// Set true to cancel waiting
 	bool displayNoToolWarning;					// True if we need to display a 'no tool selected' warning
 	bool displayDeltaNotHomedWarning;			// True if we need to display a 'attempt to move before homing on a delta printer' message
 	char filamentToLoad[FilamentNameLength];	// Name of the filament being loaded
+
+	static constexpr const char* BED_EQUATION_G = "bed.g";
+	static constexpr const char* RESUME_G = "resume.g";
+	static constexpr const char* CANCEL_G = "cancel.g";
+	static constexpr const char* STOP_G = "stop.g";
+	static constexpr const char* SLEEP_G = "sleep.g";
+	static constexpr const char* CONFIG_OVERRIDE_G = "config-override.g";
+	static constexpr const char* DEPLOYPROBE_G = "deployprobe.g";
+	static constexpr const char* RETRACTPROBE_G = "retractprobe.g";
+	static constexpr const char* RESUME_PROLOGUE_G = "resurrect-prologue.g";
+	static constexpr const char* PAUSE_G = "pause.g";
+	static constexpr const char* HOME_ALL_G = "homeall.g";
+	static constexpr const char* HOME_DELTA_G = "homedelta.g";
+	static constexpr const char* DefaultHeightMapFile = "heightmap.csv";
+	static constexpr const char* LOAD_FILAMENT_G = "load.g";
+	static constexpr const char* UNLOAD_FILAMENT_G = "unload.g";
+
+#ifdef DUET_NG
+	static constexpr const char* POWER_FAIL_G = "powerfail.g";
+	static constexpr const char* POWER_RESTORE_G = "powerrestore.g";
+	static constexpr const char* RESUME_AFTER_POWER_FAIL_G = "resurrect.g";
+#endif
+
+	static constexpr const float MinServoPulseWidth = 544.0, MaxServoPulseWidth = 2400.0;
+	static const uint16_t ServoRefreshFrequency = 50;
 };
 
 //*****************************************************************************************************
