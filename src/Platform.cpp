@@ -24,6 +24,7 @@
 #include "Heating/Heat.h"
 #include "Movement/DDA.h"
 #include "Movement/Move.h"
+#include "PrintMonitor.h"
 #include "FilamentSensors/FilamentSensor.h"
 #include "Network.h"
 #include "RepRap.h"
@@ -523,7 +524,7 @@ void Platform::Init()
 	temperatureShutdownDrivers = temperatureWarningDrivers = shortToGroundDrivers = openLoadDrivers = 0;
 	onBoardDriversFanRunning = offBoardDriversFanRunning = false;
 	autoSaveEnabled = false;
-	autoSaveState = AutoSaveState::normal;
+	autoSaveState = AutoSaveState::starting;
 #endif
 
 	// Allow extrusion ancillary PWM to use FAN0 even if FAN0 has not been disabled, for backwards compatibility
@@ -685,7 +686,7 @@ void Platform::InitZProbe()
 	case 4:
 		AnalogInEnableChannel(zProbeAdcChannel, false);
 		pinMode(zProbePin, INPUT_PULLUP);
-		pinMode(endStopPins[E0_AXIS], INPUT_PULLUP);
+		pinMode(endStopPins[E0_AXIS], INPUT);
 		pinMode(zProbeModulationPin, OUTPUT_LOW);		// we now set the modulation output high during probing only when using probe types 4 and higher
 		break;
 
@@ -699,7 +700,7 @@ void Platform::InitZProbe()
 	case 6:
 		AnalogInEnableChannel(zProbeAdcChannel, false);
 		pinMode(zProbePin, INPUT_PULLUP);
-		pinMode(endStopPins[E0_AXIS + 1], INPUT_PULLUP);
+		pinMode(endStopPins[E0_AXIS + 1], INPUT);
 		pinMode(zProbeModulationPin, OUTPUT_LOW);		// we now set the modulation output high during probing only when using probe types 4 and higher
 		break;
 
@@ -1327,14 +1328,17 @@ void Platform::Spin()
 
 	// Check the MCU max and min temperatures
 #ifndef __RADDS__
-	const uint32_t currentMcuTemperature = cpuTemperatureFilter.GetSum();
-	if (currentMcuTemperature > highestMcuTemperature)
+	if (cpuTemperatureFilter.IsValid())
 	{
-		highestMcuTemperature= currentMcuTemperature;
-	}
-	if (currentMcuTemperature < lowestMcuTemperature && currentMcuTemperature != 0)
-	{
-		lowestMcuTemperature = currentMcuTemperature;
+		const uint32_t currentMcuTemperature = cpuTemperatureFilter.GetSum();
+		if (currentMcuTemperature > highestMcuTemperature)
+		{
+			highestMcuTemperature= currentMcuTemperature;
+		}
+		if (currentMcuTemperature < lowestMcuTemperature)
+		{
+			lowestMcuTemperature = currentMcuTemperature;
+		}
 	}
 #endif
 
@@ -1429,7 +1433,8 @@ void Platform::Spin()
 			bool reported = false;
 			ReportDrivers(shortToGroundDrivers, "Error: Short-to-ground", reported);
 			ReportDrivers(temperatureShutdownDrivers, "Error: Over temperature shutdown", reported);
-//			ReportDrivers(openLoadDrivers, "Error: Open load", reported);
+			// Don't report open load because we get too many spurious open load reports
+			//ReportDrivers(openLoadDrivers, "Error: Open load", reported);
 
 			// Don't want about a hot driver if we recently turned on a fan to cool it
 			if (temperatureWarningDrivers != 0)
@@ -1476,6 +1481,13 @@ void Platform::Spin()
 	{
 		switch (autoSaveState)
 		{
+		case AutoSaveState::starting:
+			if (currentVin >= autoResumeReading)
+			{
+				autoSaveState = AutoSaveState::normal;
+			}
+			break;
+
 		case AutoSaveState::normal:
 			if (currentVin < autoPauseReading)
 			{
@@ -1520,11 +1532,32 @@ void Platform::Spin()
 #endif
 
 	// Filament sensors
-	for (size_t i = 0; i < MaxExtruders; ++i)
+	for (size_t extruder = 0; extruder < MaxExtruders; ++extruder)
 	{
-		if (filamentSensors[i] != nullptr)
+		if (filamentSensors[extruder] != nullptr)
 		{
-			filamentSensors[i]->Poll();
+			GCodes& gCodes = reprap.GetGCodes();
+			const float extrusionCommanded = (float)reprap.GetMove().GetAccumulatedExtrusion(extruder)/driveStepsPerUnit[extruder + gCodes.GetTotalAxes()];
+																													// get and clear the Move extrusion commanded
+			if (reprap.GetPrintMonitor().IsPrinting() && !gCodes.IsPausing() && !gCodes.IsResuming() && !gCodes.IsPaused())
+			{
+				const FilamentSensorStatus fstat = filamentSensors[extruder]->Check(extrusionCommanded);
+				if (fstat != FilamentSensorStatus::ok && extrusionCommanded > 0.0)
+				{
+					if (reprap.Debug(moduleFilamentSensors))
+					{
+						debugPrintf("Filament error: extruder %u reports %s\n", extruder, FilamentSensor::GetErrorMessage(fstat));
+					}
+					else
+					{
+						gCodes.FilamentError(extruder, fstat);
+					}
+				}
+			}
+			else
+			{
+				filamentSensors[extruder]->Clear();
+			}
 		}
 	}
 
@@ -3045,6 +3078,7 @@ void Platform::SendAlert(MessageType mt, const char *message, const char *title,
 	{
 	case HTTP_MESSAGE:
 	case AUX_MESSAGE:
+	case GENERIC_MESSAGE:
 		// Make the RepRap class cache this message until it's picked up by the HTTP clients and/or PanelDue
 		reprap.SetAlert(message, title, sParam, tParam, zParam);
 		break;
