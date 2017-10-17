@@ -32,6 +32,13 @@ const size_t ToolNameLength = 32;						// maximum allowed length for tool names
 const AxesBitmap DefaultXAxisMapping = 1u << X_AXIS;	// by default, X is mapped to X
 const AxesBitmap DefaultYAxisMapping = 1u << Y_AXIS;	// by default, Y is mapped to Y
 
+enum class ToolState : uint8_t
+{
+	off = 0,
+	active,
+	standby
+};
+
 class Filament;
 class Tool
 {
@@ -40,8 +47,9 @@ public:
 	static Tool *Create(int toolNumber, const char *name, long d[], size_t dCount, long h[], size_t hCount, AxesBitmap xMap, AxesBitmap yMap, FansBitmap fanMap, StringRef& reply);
 	static void Delete(Tool *t);
 
-	const float *GetOffset() const;
-	void SetOffset(const float offs[MaxAxes]);
+	const float *GetOffsets() const;
+	void SetOffsets(const float offs[MaxAxes]);
+	void SetOffset(size_t axis, float offs) pre(axis < MaxAxes);
 	size_t DriveCount() const;
 	int Drive(size_t driveNumber) const;
 	bool ToolCanDrive(bool extrude);
@@ -61,10 +69,8 @@ public:
 	FansBitmap GetFanMapping() const { return fanMapping; }
 	Filament *GetFilament() const { return filament; }
 	Tool *Next() const { return next; }
-
-#ifdef DUET_NG
+	ToolState GetState() const { return state; }
 	bool WriteSettings(FileStore *f) const;			// write the tool's settings to file
-#endif
 
 	friend class RepRap;
 
@@ -98,14 +104,7 @@ private:
 	Filament *filament;
 	Tool* next;
 
-	enum class ToolState : uint8_t
-	{
-		off = 0,
-		active,
-		standby
-	};
 	ToolState state;
-
 	bool heaterFault;
 	volatile bool displayColdExtrudeWarning;
 };
@@ -145,17 +144,14 @@ inline size_t Tool::DriveCount() const
 	return driveCount;
 }
 
-inline const float *Tool::GetOffset() const
+inline const float *Tool::GetOffsets() const
 {
 	return offset;
 }
 
-inline void Tool::SetOffset(const float offs[MaxAxes])
+inline void Tool::SetOffset(size_t axis, float offs)
 {
-	for(size_t i = 0; i < MaxAxes; ++i)
-	{
-		offset[i] = offs[i];
-	}
+	offset[axis] = offs;
 }
 
 #endif /* TOOL_H_ */

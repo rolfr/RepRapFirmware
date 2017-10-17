@@ -1,15 +1,109 @@
 Summary of important changes in recent versions
 ===============================================
 
-Version 1.19RC6
-===============
+Version 1.20beta1
+=================
 
 Upgrade notes:
-- Recommended DuetWebControl version is 1.19RC1
-- Recommended DuetWiFiServer version is 1.19beta10
+- If installing this release on a Duet WiFi, install DuetWiFiServer version 1.20 alpha first, available at https://github.com/dc42/DuetWiFiSocketServer/blob/master/Release/DuetWiFiServer.bin.
+- Recommended Duet Web Control version is 1.19.3
+- The 'set output on extrude' function (M571) no longer defaults to FAN0 output. If you use this feature, you must define the output pin explicitly using the P parameter at least once.
+
+New and changed features:
+- Added support for M3, M4, M5 and M450-M453
+- Added support for DHT11, DHT21 and DHT22 temperature/humidity sensors (thanks chrishamm)
+- Some additional events are now logged
+- The grid defined by M557 is now stored separately from the grid loaded by G29 S1 so that they don't overwrite each other
+- The resurrect.g file is no longer created or deleted during a simulated print
+- SCARA prints are simulated without segmentation so that the simulation runs much faster. In tests, the difference in the simulation time with/without segmentation was negligible.
+- The change to fast PID parameters is now made when the temperature is within 3C of the target instead of when within 1C
+- M408 S1/2/3 responses now include dummy values for the bed heater if there is no bed heater
+- The commands to resume printing that are written to resurrect.g now move the head to 2mm above the printing height, then sideways, then down
+
+Bug fixes:
+- If a Duet3D filament sensor was connected and congfigured but flashing an error code instead of sending filament data, the error recovery code running on the Duet caused short pauses in the print
+- On a delta printer if you created additonal axes, when you tried to home them it ran homedelta.g instead of e.g. homeu.g
+- On a delta printer with additional axes, you can now do XYZ moves as soon as the towers have been homed
+- Fixed a possible race condition if the time and date were set at midnight
+- The 4-leadscrew auto/4-screw manual bed levelling code didn't work properly
+- The P parameter was missing from G10 commands written to resurrect.g
+- Arm angle limits are now applied when converting Cartesian to SCARA coordinates
+- The correction limit is no longer applied when computing manual bed levelling screw corrections
+- SCARA arm mode changes are now only permitted in uncoordinated (G0) moves
+
+Version 1.20alpha4
+==================
+
+Upgrade notes from 1.19.2:
+- If installing this release on a Duet WiFi, install DuetWiFiServer version 1.20 alpha first, available at https://github.com/dc42/DuetWiFiSocketServer/blob/master/Release/DuetWiFiServer.bin.
+- Recommended Duet Web Control version is still 1.19
+
+New and changed features:
+- Added event logging, controlled by the M929 command
+- On the Duet WiFi the M552 command takes an optional SSID parameter, allowing you to connect to a specified SSID even if it is hidden
+- M572 command now allows multiple colon-separate D values
+- When M591 and G32 are used to produce manual bed levelling adjustments, the first screw defined in the M671 command is left alone. Previously the screw needing the smallest correction was left alone.
+- SCARA printers can now use the manual bed levelling assistant
+- The thermocouple type letter in the M305 command to configure a MAX31856-based thermocouple adapter may now be in lower case
+- Added protection against a dud command line containing letter M being interpreted as a M0 command
+- When doing a firmware upgrade, the message sent to the USB port now warns that the USB will be disconnected
+- A resurrect.g file is now created any time the print is paused. This allows for planned power down ands resume.
+
+Internal changes:
+- Upgraded compiler version
+- Changed to use the hardware floating point ABI on the SAM4
+- Simplified conditional directives that depend on the target hardware, by adding new #defines for supported features and a DUET_06_085 #define.
+
+Bug fixes:
+- When G29 was run on a SCARA printer, probe points could be incorrectly skipped and spurious "not reachable" messages generated
+- Pullup resistors are now enabled on endstop inputs 10 and 11 on the CONN_SD connector
+- Fixed duplicate error message when a gcode file is not found
+- Fixed reference to homing the towers of a SCARA printer in an error message
+
+Version 1.19.2
+==============
+
+Upgrade notes from version 1.19:
+- If your printer is a SCARA then you now need to set appropriate M208 lower and upper limits for X and Y
+- If you are upgrading a Duet WiFi from firmware 1.19, install DuetWiFiFirmware 1.19.2 first, and confirm that the new version is running before installing DuetWiFiServer 1.19.2
+- **Important!** See also the upgrade notes for version 1.19 if you are upgrading from 1.18.2 or earlier
+- Recommended DuetWebControl version is 1.19
+- Recommended DuetWiFiServer version is 1.19.2
+
+New and changed features:
+- M37 P parameter is supported. If you send M37 P"file.g" then printing file.g will be simulated and the expected print time reported.
+- The bed adjusting wizard now leaves one of the screws alone when suggesting corrections
+- The machine name and the password in the M550 and M551 commands may now be quoted, optionally
+- If M104 T# is used and tool # is currently in standby, then its standby temperature will be set as well as its active temperature
+- SCARA kinematic calculations have been speeded up
+- SCARA segments/second now defaults to 100
+- SCARA printers now apply the M208 axis limits to X and Y as well as to other axes. Minimum and maximum radius limits are still applied too.
+- SCARA M669 S and T parameters can be changed on the fly, i.e. re-homing is no longer required when they are changed
+- Minimum limits are applied to the parameters of M92, M201 and M203 commands to avoid firmware crashes if bad values are supplied
+- In conjunction with DuetWiFiServer 1.19.2, if connection to the access point is lost and the automatic reconnection attempt fails, the WiFi module will attempt a manual reconnect. Reconnection attempts are reported to PanelDue and to USB, and the reconnect count is included in the M122 report.
+- Jerk is no longer applied to the boundaries between travel moves and printing moves
+
+Bug fixes:
+- Incorrect, very large height errors were sometimes shown in the G29 height map when the number of probe points used approached the maximum supported
+- M669 was supposed to report the current kinematics, but didn't except for SCARA printers
+- SCARA kinematics didn't apply limits to the Z axis or to any additional axes. Delta printers didn't apply limits to any additional axes.
+- SCARA forward kinematics were wrong
+- SCARA minimum radius limit was wrong
+- If the number of commands in the deferred command queue exceeded 8, commands could be lost
+- If a G1 command was used with a coordinate for an axis that X or Y was mapped, that coordinate was ignored unless the S1 or S2 command modifier was used. This affected tool change files on IDEX machines.
+- If a reset was forced by the software watchdog because it got stuck in a spin loop, the reset reason in M122 was displayed as 'User'
+- The progress bar on PanelDue and the estimated end time based on filament usage were slightly ahead of the true values, especially for small gcode files
+- If a move had a tiny amount of XY movement and a much larger amount of extrusion, an extrusion speed in excess of the extruder speed limit set in M203 might be used. This could also be triggered if a move that was too short to need any steps was followed by a pure extrusion move.
+
+Version 1.19
+============
+
+Upgrade notes from version 1.18.2:
+- Recommended DuetWebControl version is 1.19
+- Recommended DuetWiFiServer version is 1.19
 - **Important!** If you use an IR Z probe or some other type that does not need to be deployed, delete the files sys/deployprobe and sys/retractprobe.g if they exist, because they are now called automatically. You can do this in the System Files Editor of the web interface.
 - **Important!** On a CoreXY machine, if upgrading from a version prior to 1.19beta9, you need to reverse the Y motor direction in the M569 command. Similarly for CoreXYU machines.
-- **Important!**  When upgrading a Duet WiFi from 1.18.2 or earlier firmware, see the important notes at https://duet3d.com/wiki/DuetWiFiFirmware_1.19beta.
+- **Important!**  When upgrading a Duet WiFi from 1.18.2 or earlier firmware, see the important notes at https://duet3d.com/wiki/Upgrading_to_DuetWiFiFirmware_1.19.
 - Height map files created with firmware 1.18 or earlier cannot be read by firmware 1.19, so you will need to run G29 S0 again to generate a new heightmap.csv file
 - Height map filenames in G29, M374 and M375 commands must now be enclosed in double quotes
 - Every heater that you use must now be configured using a M305 command with a P parameter that identifies the heater. Previously, if a heater used default thermistor parameters, you could omit the M305 command for that heater.
@@ -93,7 +187,7 @@ New features since 1.18.2:
 - String parameters in some gcode commands, such as filenames, can now be enclosed in double quotation marks to avoid ambiguity
 - When tuning a bed or chamber heater, more time is allowed for the temperature to start rising
 - On the Duet WiFi the network code has been rewritten. The web server now runs on the Duet instead of on the WiFi module. FTP and Telnet are supported if enabled using M586. New commands M587, M588 and M589 are supported. The meaning of the M552 S parameter has changed: S-1 holds the WiFi module in the reset state, S0 holds it in the Idle state allowing it to process M587/M588/M589 commands, S1 starts it in client mode and S2 starts it in access point mode. The M122 diagnostic report includes WiFi module parameters unless the WiFi module is being held in the reset state.
-- Support for simple switch-based filament sensors and the Duet3D filament sensor is partly implemented, but should not be relied on in this release.
+- Added support for simple switch-based filament sensors and the Duet3D filament sensor.
 
 Bug fixes:
 - XYZ coordinates could be reported as NaN in DWC status responses, causing AJAX errors

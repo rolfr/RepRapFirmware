@@ -53,7 +53,7 @@ public:
 	void DisableProtocol(int protocol, StringRef& reply);
 	void ReportProtocols(StringRef& reply) const;
 
-	void Enable(int mode, StringRef& reply);			// enable or disable the network
+	void Enable(int mode, const StringRef& ssid, StringRef& reply);			// enable or disable the network
 	bool GetNetworkState(StringRef& reply);
 	int EnableState() const;
 
@@ -130,7 +130,7 @@ private:
 	NetworkResponder *nextResponderToPoll;
 	FtpResponder *ftpResponder;
 	TelnetResponder *telnetResponder;
-	float longWait;
+	uint32_t longWait;
 	uint32_t lastTickMillis;
 
 	WifiFirmwareUploader *uploader;
@@ -152,10 +152,12 @@ private:
 	uint8_t netmask[4];
 	uint8_t gateway[4];
 	char hostname[16];								// Limit DHCP hostname to 15 characters + terminating 0
-	char ssid[SsidLength + 1];
+	char requestedSsid[SsidLength + 1];
+	char actualSsid[SsidLength + 1];
 
-	uint32_t spiTxUnderruns;
-	uint32_t spiRxOverruns;
+	unsigned int spiTxUnderruns;
+	unsigned int spiRxOverruns;
+	unsigned int reconnectCount;
 
 	char wiFiServerVersion[16];
 };

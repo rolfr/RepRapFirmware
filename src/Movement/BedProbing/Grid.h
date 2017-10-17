@@ -19,7 +19,6 @@ public:
 	friend class HeightMap;
 
 	GridDefinition();
-	GridDefinition(const float xRange[2], const float yRange[2], float pRadius, const float pSpacings[2]);
 
 	uint32_t NumXpoints() const { return numX; }
 	uint32_t NumYpoints() const { return numY; }
@@ -29,6 +28,7 @@ public:
 	bool IsInRadius(float x, float y) const;
 	bool IsValid() const { return isValid; }
 
+	bool Set(const float xRange[2], const float yRange[2], float pRadius, const float pSpacings[2]);
 	void PrintParameters(StringRef& r) const;
 	void WriteHeadingAndParameters(StringRef& r) const;
 	static int CheckHeading(const StringRef& s);
@@ -87,7 +87,7 @@ private:
 
 	GridDefinition def;
 	float gridHeights[MaxGridProbePoints];							// The Z coordinates of the points on the bed that were probed
-	uint32_t gridHeightSet[MaxGridProbePoints/32];					// Bitmap of which heights are set
+	uint32_t gridHeightSet[(MaxGridProbePoints + 31)/32];			// Bitmap of which heights are set
 	bool useMap;													// True to do bed compensation
 
 	uint32_t GetMapIndex(uint32_t xIndex, uint32_t yIndex) const { return (yIndex * def.NumXpoints()) + xIndex; }

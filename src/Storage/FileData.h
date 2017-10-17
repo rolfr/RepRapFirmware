@@ -56,6 +56,11 @@ public:
 		return f->Write(b);
 	}
 
+	bool Write(const char *s)
+	{
+		return f->Write(s, strlen(s));
+	}
+
 	bool Write(const char *s, size_t len)
 	{
 		return f->Write(s, len);
@@ -79,11 +84,6 @@ public:
 	bool Seek(FilePosition position)
 	{
 		return f->Seek(position);
-	}
-
-	float FractionRead() const
-	{
-		return (f == nullptr ? -1.0 : f->FractionRead());
 	}
 
 	FilePosition Length() const

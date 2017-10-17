@@ -95,7 +95,7 @@ typedef uint32_t FansBitmap;				// Type of a bitmap representing a set of fan nu
 extern RepRap reprap;
 
 // Functions and globals not part of any class
-extern "C" void debugPrintf(const char* fmt, ...);
+extern "C" void debugPrintf(const char* fmt, ...) __attribute__ ((format (printf, 1, 2)));
 
 bool StringEndsWith(const char* string, const char* ending);
 bool StringStartsWith(const char* string, const char* starting);
@@ -171,7 +171,7 @@ template<typename BitmapType> BitmapType LongArrayToBitMap(const long *arr, size
 	for (size_t i = 0; i < numEntries; ++i)
 	{
 		const long f = arr[i];
-		if (f >= 0 && f < sizeof(BitmapType) * CHAR_BIT)
+		if (f >= 0 && (unsigned long)f < sizeof(BitmapType) * CHAR_BIT)
 		{
 			SetBit(res, (unsigned int)f);
 		}
@@ -211,15 +211,16 @@ const uint32_t NvicPriorityWatchdog = 0;		// watchdog has highest priority (SAM4
 
 const uint32_t NvicPriorityUart = 1;			// UART is next to avoid character loss
 const uint32_t NvicPrioritySystick = 2;			// systick kicks the watchdog and starts the ADC conversions, so must be quite high
-const uint32_t NvicPriorityStep = 3;			// step interrupt is next highest, it can preempt most other interrupts
+const uint32_t NvicPriorityPins = 3;			// priority for GPIO pin interrupts - filament sensors must be higher than step
+const uint32_t NvicPriorityStep = 4;			// step interrupt is next highest, it can preempt most other interrupts
+const uint32_t NvicPriorityUSB = 5;				// USB interrupt
 
-#if !defined(DUET_NG) && !defined(__RADDS__)
-const uint32_t NvicPriorityNetworkTick = 4;		// priority for network tick interrupt
-const uint32_t NvicPriorityEthernet = 4;		// priority for Ethernet interface
+#if HAS_LWIP_NETWORKING
+const uint32_t NvicPriorityNetworkTick = 5;		// priority for network tick interrupt
+const uint32_t NvicPriorityEthernet = 5;		// priority for Ethernet interface
 #endif
 
-const uint32_t NvicPrioritySpi = 5;				// SPI used for network transfers on Duet WiFi/Duet vEthernet
-const uint32_t NvicPriorityPins = 6;			// priority for GPIO pin interrupts
+const uint32_t NvicPrioritySpi = 6;				// SPI used for network transfers on Duet WiFi/Duet vEthernet
 const uint32_t NvicPriorityTwi = 7;				// TWI used to read endstop and other inputs on the DueXn
 
 #endif

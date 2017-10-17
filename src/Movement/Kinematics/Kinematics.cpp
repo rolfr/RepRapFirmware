@@ -18,15 +18,9 @@
 const char *Kinematics::HomeAllFileName = "homeall.g";
 const char * const Kinematics::StandardHomingFileNames[] = AXES_("homex.g", "homey.g", "homez.g", "homeu.g", "homev.g", "homew.g", "homea.g", "homeb.g", "homec.g");
 
-// Constructor for non-segmented kinematics
-Kinematics::Kinematics(KinematicsType t)
-	: useSegmentation(false), useRawG0(true), type(t)
-{
-}
-
-// Constructor for segmented kinematics
+// Constructor. Pass segsPerSecond <= 0.0 to get non-segmented kinematics.
 Kinematics::Kinematics(KinematicsType t, float segsPerSecond, float minSegLength, bool doUseRawG0)
-	: segmentsPerSecond(segsPerSecond), minSegmentLength(minSegLength), useSegmentation(true), useRawG0(doUseRawG0), type(t)
+	: segmentsPerSecond(segsPerSecond), minSegmentLength(minSegLength), useSegmentation(segsPerSecond > 0.0), useRawG0(doUseRawG0), type(t)
 {
 }
 
@@ -34,13 +28,20 @@ Kinematics::Kinematics(KinematicsType t, float segsPerSecond, float minSegLength
 // This is the fallback function for when the derived class doesn't use the specified M-code
 bool Kinematics::Configure(unsigned int mCode, GCodeBuffer& gb, StringRef& reply, bool& error)
 {
-	reply.printf("M%u parameters do not apply to %s kinematics", mCode, GetName());
-	error = true;
+	if (mCode == 669)
+	{
+		reply.printf("Current kinematics is %s", GetName());
+	}
+	else
+	{
+		reply.printf("M%u parameters do not apply to %s kinematics", mCode, GetName());
+		error = true;
+	}
 	return false;
 }
 
 // Return true if the specified XY position is reachable by the print head reference point.
-// This default implementation assumes a rectangular reachable area, so it just uses the bed dimensions give in the M280 command.
+// This default implementation assumes a rectangular reachable area, so it just uses the bed dimensions give in the M208 command.
 bool Kinematics::IsReachable(float x, float y) const
 {
 	const Platform& platform = reprap.GetPlatform();
@@ -51,11 +52,18 @@ bool Kinematics::IsReachable(float x, float y) const
 // This default implementation just applies the rectangular limits set up by M208 to those axes that have been homed.
 bool Kinematics::LimitPosition(float coords[], size_t numVisibleAxes, AxesBitmap axesHomed) const
 {
+	return LimitPositionFromAxis(coords, 0, numVisibleAxes, axesHomed);
+}
+
+// Apply the M208 limits to the Cartesian position that the user wants to move to for all axes from the specified one upwards
+// Return true if any coordinates were changed
+bool Kinematics::LimitPositionFromAxis(float coords[], size_t firstAxis, size_t numVisibleAxes, AxesBitmap axesHomed) const
+{
 	const Platform& platform = reprap.GetPlatform();
 	bool limited = false;
-	for (size_t axis = 0; axis < numVisibleAxes; axis++)
+	for (size_t axis = firstAxis; axis < numVisibleAxes; axis++)
 	{
-		if ((axesHomed & (1 << axis)) != 0)
+		if (IsBitSet(axesHomed, axis))
 		{
 			float& f = coords[axis];
 			if (f < platform.AxisMinimum(axis))
@@ -87,7 +95,7 @@ void Kinematics::GetAssumedInitialPosition(size_t numAxes, float positions[]) co
 // If we can proceed with homing some axes, return the name of the homing file to be called.
 // If we can't proceed because other axes need to be homed first, return nullptr and pass those axes back in 'mustBeHomedFirst'.
 // This default is suitable for most kinematics.
-const char* Kinematics::GetHomingFileName(AxesBitmap toBeHomed, AxesBitmap& alreadyHomed, size_t numVisibleAxes, AxesBitmap& mustHomeFirst) const
+const char* Kinematics::GetHomingFileName(AxesBitmap toBeHomed, AxesBitmap alreadyHomed, size_t numVisibleAxes, AxesBitmap& mustHomeFirst) const
 {
 	const AxesBitmap allAxes = LowestNBits<AxesBitmap>(numVisibleAxes);
 	if ((toBeHomed & allAxes) == allAxes)
@@ -150,7 +158,7 @@ const char* Kinematics::GetHomingFileName(AxesBitmap toBeHomed, AxesBitmap& alre
 	{
 		for (size_t j = 0; j < maxCols; ++j)
 		{
-			debugPrintf("%7.4f%c", m(i, j), (j == maxCols - 1) ? '\n' : ' ');
+			debugPrintf("%7.4f%c", (double)m(i, j), (j == maxCols - 1) ? '\n' : ' ');
 		}
 	}
 }
@@ -160,7 +168,7 @@ const char* Kinematics::GetHomingFileName(AxesBitmap toBeHomed, AxesBitmap& alre
 	debugPrintf("%s:", s);
 	for (size_t i = 0; i < numElems; ++i)
 	{
-		debugPrintf(" %7.4f", v[i]);
+		debugPrintf(" %7.4f", (double)v[i]);
 	}
 	debugPrintf("\n");
 }

@@ -58,7 +58,8 @@ public:
 
 	// Set or report the parameters from a M665, M666 or M669 command
 	// If 'mCode' is an M-code used to set parameters for the current kinematics (which should only ever be 665, 666, 667 or 669)
-	// then search for parameters used to configure the current kinematics. If any are found, perform appropriate actions and return true.
+	// then search for parameters used to configure the current kinematics. If any are found, perform appropriate actions,
+	// and return true if the changes affect the geometry.
 	// If errors were discovered while processing parameters, put an appropriate error message in 'reply' and set 'error' to true.
 	// If no relevant parameters are found, print the existing ones to 'reply' and return false.
 	// If 'mCode' does not apply to this kinematics, call the base class version of this function, which will print a suitable error message.
@@ -70,7 +71,7 @@ public:
 	// 'numAxes' is the number of machine axes to convert, which will always be at least 3
 	// 'motorPos' is the output vector of motor positions
 	// Return true if successful, false if we were unable to convert
-	virtual bool CartesianToMotorSteps(const float machinePos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, int32_t motorPos[]) const = 0;
+	virtual bool CartesianToMotorSteps(const float machinePos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, int32_t motorPos[], bool allowModeChange) const = 0;
 
 	// Convert motor positions (measured in steps from reference position) to Cartesian coordinates
 	// 'motorPos' is the input vector of motor positions
@@ -84,8 +85,9 @@ public:
 	virtual bool SupportsAutoCalibration() const { return false; }
 
 	// Perform auto calibration. Override this implementation in kinematics that support it. Caller already owns the movement lock.
-	virtual void DoAutoCalibration(size_t numFactors, const RandomProbePointSet& probePoints, StringRef& reply)
-	pre(SupportsAutoCalibration()) { }
+	// Return true if an error occurred.
+	virtual bool DoAutoCalibration(size_t numFactors, const RandomProbePointSet& probePoints, StringRef& reply)
+	pre(SupportsAutoCalibration()) { return false; }
 
 	// Set the default parameters that are changed by auto calibration back to their defaults.
 	// Do nothing if auto calibration is not supported.
@@ -127,7 +129,7 @@ public:
 	// If we can proceed with homing some axes, return the name of the homing file to be called. Optionally, update 'alreadyHomed' to indicate
 	// that some additional axes should be considered not homed.
 	// If we can't proceed because other axes need to be homed first, return nullptr and pass those axes back in 'mustBeHomedFirst'.
-	virtual const char* GetHomingFileName(AxesBitmap toBeHomed, AxesBitmap& alreadyHomed, size_t numVisibleAxes, AxesBitmap& mustHomeFirst) const;
+	virtual const char* GetHomingFileName(AxesBitmap toBeHomed, AxesBitmap alreadyHomed, size_t numVisibleAxes, AxesBitmap& mustHomeFirst) const;
 
 	// This function is called from the step ISR when an endstop switch is triggered during homing.
 	// Return true if the entire homing move should be terminated, false if only the motor associated with the endstop switch should be stopped.
@@ -144,10 +146,8 @@ public:
 	// This default is good for Cartesian and Core printers, but not deltas or SCARA
 	virtual AxesBitmap AxesAssumedHomed(AxesBitmap g92Axes) const { return g92Axes; }
 
-#ifdef DUET_NG
 	// Write any calibration data that we need to resume a print after power fail, returning true if successful. Override where necessary.
 	virtual bool WriteResumeSettings(FileStore *f) const { return true; }
-#endif
 
 	// Override this virtual destructor if your constructor allocates any dynamic memory
 	virtual ~Kinematics() { }
@@ -165,11 +165,12 @@ public:
 	float GetMinSegmentLength() const pre(UseSegmentation()) { return minSegmentLength; }
 
 protected:
-	// This constructor is used by derived classes that implement non-segmented linear motion
-	Kinematics(KinematicsType t);
-
-	// This constructor is used by derived classes that implement segmented linear motion
+	// Constructor. Pass segsPerSecond <= 0.0 to get non-segmented motion.
 	Kinematics(KinematicsType t, float segsPerSecond, float minSegLength, bool doUseRawG0);
+
+	// Apply the M208 limits to the Cartesian position that the user wants to move to for all axes from the specified one upwards
+	// Return true if any coordinates were changed
+	bool LimitPositionFromAxis(float coords[], size_t firstAxis, size_t numVisibleAxes, AxesBitmap axesHomed) const;
 
 	// Debugging functions
 	static void PrintMatrix(const char* s, const MathMatrix<floatc_t>& m, size_t numRows = 0, size_t maxCols = 0);

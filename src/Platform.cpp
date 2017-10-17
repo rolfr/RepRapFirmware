@@ -48,6 +48,10 @@
 extern char _end;
 extern "C" char *sbrk(int i);
 
+#if !defined(HAS_LWIP_NETWORKING) || !defined(HAS_CPU_TEMP_SENSOR) || !defined(HAS_HIGH_SPEED_SD)
+# error Missing feature definition
+#endif
+
 #ifdef DUET_NG
 
 inline constexpr float AdcReadingToPowerVoltage(uint16_t adcVal)
@@ -76,14 +80,14 @@ static volatile uint32_t fanInterval = 0;			// written by ISR, read outside the 
 
 const float minStepPulseTiming = 0.2;				// we assume that we always generate step high and low times at least this wide without special action
 
-const int Heater0LogicalPin = 0;
-const int Fan0LogicalPin = 20;
-const int EndstopXLogicalPin = 40;
-const int Special0LogicalPin = 60;
+const LogicalPin Heater0LogicalPin = 0;
+const LogicalPin Fan0LogicalPin = 20;
+const LogicalPin EndstopXLogicalPin = 40;
+const LogicalPin Special0LogicalPin = 60;
 
 #ifdef DUET_NG
-const int DueX5Gpio0LogicalPin = 100;
-const int AdditionalExpansionLogicalPin = 120;
+const LogicalPin DueX5Gpio0LogicalPin = 100;
+const LogicalPin AdditionalExpansionLogicalPin = 120;
 #endif
 
 //#define MOVE_DEBUG
@@ -243,7 +247,7 @@ float ZProbeParameters::GetStopHeight(float temperature) const
 
 bool ZProbeParameters::WriteParameters(FileStore *f, unsigned int probeType) const
 {
-	scratchString.printf("G31 T%u P%d X%.1f Y%.1f Z%.2f\n", probeType, adcValue, xOffset, yOffset, height);
+	scratchString.printf("G31 T%u P%" PRIu32 " X%.1f Y%.1f Z%.2f\n", probeType, adcValue, (double)xOffset, (double)yOffset, (double)height);
 	return f->Write(scratchString.Pointer());
 }
 
@@ -251,7 +255,7 @@ bool ZProbeParameters::WriteParameters(FileStore *f, unsigned int probeType) con
 // Platform class
 
 Platform::Platform() :
-		board(DEFAULT_BOARD_TYPE), active(false), errorCodeBits(0), lastFanCheckTime(0),
+		logger(nullptr), lastLogFlushTime(0), board(DEFAULT_BOARD_TYPE), active(false), errorCodeBits(0), lastFanCheckTime(0),
 		auxGCodeReply(nullptr), fileStructureInitialised(false), tickState(0), debugCode(0)
 #ifdef DUET_NG
 		, lastWarningMillis(0), nextDriveToPoll(0),
@@ -266,7 +270,6 @@ Platform::Platform() :
 	usbOutput = new OutputStack();
 
 	// Files
-
 	massStorage = new MassStorage(this);
 
 	for (size_t i = 0; i < MAX_FILES; i++)
@@ -290,12 +293,12 @@ void Platform::Init()
 	// Comms
 	baudRates[0] = MAIN_BAUD_RATE;
 	baudRates[1] = AUX_BAUD_RATE;
-#if NUM_SERIAL_CHANNELS >= 2
+#ifdef SERIAL_AUX2_DEVICE
 	baudRates[2] = AUX2_BAUD_RATE;
 #endif
 	commsParams[0] = 0;
 	commsParams[1] = 1;							// by default we require a checksum on data from the aux port, to guard against overrun errors
-#if NUM_SERIAL_CHANNELS >= 2
+#ifdef SERIAL_AUX2_DEVICE
 	commsParams[2] = 0;
 #endif
 
@@ -345,16 +348,6 @@ void Platform::Init()
 	ARRAY_INIT(macAddress, DefaultMacAddress);
 #endif
 
-	zProbeType = 0;	// Default is to use no Z probe switch
-	zProbeAxes = Z_PROBE_AXES;
-	SetZProbeDefaults();
-
-	// We need to initialise at least some of the time stuff before we call MassStorage::Init()
-	addToTime = 0.0;
-	lastTimeCall = 0;
-	lastTime = Time();
-	longWait = lastTime;
-
 	// File management
 	massStorage->Init();
 
@@ -365,7 +358,7 @@ void Platform::Init()
 
 	fileStructureInitialised = true;
 
-#if !defined(DUET_NG) && !defined(__RADDS__) && !defined(__ALLIGATOR__)
+#if defined(DUET_06_085)
 	mcpDuet.begin();							// only call begin once in the entire execution, this begins the I2C comms on that channel for all objects
 	mcpExpansion.setMCP4461Address(0x2E);		// not required for mcpDuet, as this uses the default address
 #endif
@@ -398,7 +391,7 @@ void Platform::Init()
 	ARRAY_INIT(instantDvs, INSTANT_DVS);
 	maxPrintingAcceleration = maxTravelAcceleration = 10000.0;
 
-#if !defined(DUET_NG) && !defined(__RADDS__) && !defined(__ALLIGATOR__)
+#if defined(DUET_06_085)
 	// Motor current setting on Duet 0.6 and 0.8.5
 	ARRAY_INIT(potWipes, POT_WIPES);
 	senseResistor = SENSE_RESISTOR;
@@ -408,15 +401,18 @@ void Platform::Init()
 #endif
 
 	// Z PROBE
+	zProbeType = 0;								// default is to use no Z probe
+	zProbeAxes = Z_PROBE_AXES;
 	zProbePin = Z_PROBE_PIN;
 	zProbeAdcChannel = PinToAdcChannel(zProbePin);
-	InitZProbe();		// this also sets up zProbeModulationPin
+	SetZProbeDefaults();
+	InitZProbe();								// this also sets up zProbeModulationPin
 
 	// AXES
 	ARRAY_INIT(axisMaxima, AXIS_MAXIMA);
 	ARRAY_INIT(axisMinima, AXIS_MINIMA);
 
-	idleCurrentFactor = DEFAULT_IDLE_CURRENT_FACTOR;
+	idleCurrentFactor = DefaultIdleCurrentFactor;
 
 	// SD card interfaces
 	for (size_t i = 0; i < NumSdCards; ++i)
@@ -434,6 +430,9 @@ void Platform::Init()
 	PIOB->PIO_OWDR = 0xFFFFFFFF;
 	PIOC->PIO_OWDR = 0xFFFFFFFF;
 	PIOD->PIO_OWDR = 0xFFFFFFFF;
+#ifdef PIOE
+	PIOE->PIO_OWDR = 0xFFFFFFFF;
+#endif
 
 	for (size_t drive = 0; drive < DRIVES; drive++)
 	{
@@ -446,12 +445,12 @@ void Platform::Init()
 			axisDrivers[drive].numDrivers = 1;
 			axisDrivers[drive].driverNumbers[0] = (uint8_t)drive;
 			endStopType[drive] =
-#if defined(DUET_NG) || defined(__RADDS__) || defined(__ALLIGATOR__)
-									EndStopType::lowEndStop;	// default to low endstop
-#else
+#if defined(DUET_06_085)
 									(drive == Y_AXIS)
 									? EndStopType::lowEndStop	// for Ormerod 2/Huxley/Mendel compatibility
 									: EndStopType::noEndStop;	// for Ormerod/Huxley/Mendel compatibility
+#else
+									EndStopType::lowEndStop;	// default to low endstop
 #endif
 			endStopLogicLevel[drive] = true;					// assume all endstops use active high logic e.g. normally-closed switch to ground
 		}
@@ -469,6 +468,20 @@ void Platform::Init()
 		motorCurrents[drive] = 0.0;
 		motorCurrentFraction[drive] = 1.0;
 		driverState[drive] = DriverStatus::disabled;
+
+		// Enable pullup resistors on endstop inputs here if necessary.
+#if defined(DUET_NG)
+		// The Duets have hardware pullup resistors/LEDs except for the two on the CONN_LCD connector.
+		// They have RC filtering on the main endstop inputs, so best not to enable the pullup resistors on these.
+		if (drive >= 10)
+		{
+			setPullup(endStopPins[drive], true);				// enable pullup on CONN_LCD endstop input
+		}
+#endif
+#if defined(__RADDS__) || defined(__ALLIGATOR__)
+		// I don't know whether RADDS and Alligator have hardware pullup resistors or not. I'll assume they might not.
+		setPullup(endStopPins[drive], true);
+#endif
 	}
 
 	slowDriverStepPulseClocks = 0;								// no extended driver timing configured yet
@@ -478,7 +491,6 @@ void Platform::Init()
 	{
 		extruderDrivers[extr] = (uint8_t)(extr + MinAxes);		// set up default extruder drive mapping
 		SetPressureAdvance(extr, 0.0);							// no pressure advance
-		filamentSensors[extr] = nullptr;						// no filament sensor
 	}
 
 #ifdef DUET_NG
@@ -527,17 +539,8 @@ void Platform::Init()
 	autoSaveState = AutoSaveState::starting;
 #endif
 
-	// Allow extrusion ancillary PWM to use FAN0 even if FAN0 has not been disabled, for backwards compatibility
 	extrusionAncilliaryPwmValue = 0.0;
-	extrusionAncilliaryPwmFrequency = DefaultPinWritePwmFreq;
-	extrusionAncilliaryPwmLogicalPin = Fan0LogicalPin;
-	extrusionAncilliaryPwmFirmwarePin = COOLING_FAN_PINS[0];
-	extrusionAncilliaryPwmInvert =
-#if defined(DUET_NG) || defined(__RADDS__) || defined(__ALLIGATOR__)
-			false;
-#else
-			(board == BoardType::Duet_06 || board == BoardType::Duet_07);
-#endif
+
 	ARRAY_INIT(tempSensePins, TEMP_SENSE_PINS);
 	ARRAY_INIT(heatOnPins, HEAT_ON_PINS);
 	ARRAY_INIT(spiTempSenseCsPins, SpiTempSensorCsPins);
@@ -565,7 +568,7 @@ void Platform::Init()
 		thermistorFilters[heater].Init(0);
 	}
 
-#ifndef __RADDS__
+#if HAS_CPU_TEMP_SENSOR
 	cpuTemperatureFilter.Init(0);
 #endif
 
@@ -602,8 +605,8 @@ void Platform::Init()
 	}
 #endif
 
-	// MCU temperature monitoring - doesn't work in RADDS due to pin assignments and SAM3X chip bug
-#ifndef __RADDS__
+	// MCU temperature monitoring
+#if HAS_CPU_TEMP_SENSOR
 	temperatureAdcChannel = GetTemperatureAdcChannel();
 	AnalogInEnableChannel(temperatureAdcChannel, true);
 	highestMcuTemperature = 0;									// the highest output we have seen from the ADC filter
@@ -625,8 +628,7 @@ void Platform::Init()
 	memset(logicalPinModes, PIN_MODE_NOT_CONFIGURED, sizeof(logicalPinModes));		// set all pins to "not configured"
 
 	// Kick everything off
-	lastTime = Time();
-	longWait = lastTime;
+	longWait = millis();
 	InitialiseInterrupts();		// also sets 'active' to true
 }
 
@@ -662,10 +664,10 @@ void Platform::InitZProbe()
 	zProbeOnFilter.Init(0);
 	zProbeOffFilter.Init(0);
 
-#if defined(DUET_NG) || defined(__RADDS__) || defined(__ALLIGATOR__)
-	zProbeModulationPin = Z_PROBE_MOD_PIN;
-#else
+#ifdef DUET_06_085
 	zProbeModulationPin = (board == BoardType::Duet_07 || board == BoardType::Duet_085) ? Z_PROBE_MOD_PIN07 : Z_PROBE_MOD_PIN;
+#else
+	zProbeModulationPin = Z_PROBE_MOD_PIN;
 #endif
 
 	switch (zProbeType)
@@ -703,12 +705,6 @@ void Platform::InitZProbe()
 		pinMode(endStopPins[E0_AXIS + 1], INPUT);
 		pinMode(zProbeModulationPin, OUTPUT_LOW);		// we now set the modulation output high during probing only when using probe types 4 and higher
 		break;
-
-	case 7:
-		AnalogInEnableChannel(zProbeAdcChannel, false);
-		pinMode(zProbePin, INPUT_PULLUP);
-		pinMode(zProbeModulationPin, OUTPUT_LOW);		// we now set the modulation output high during probing only when using probe types 4 and higher
-		break;	//TODO (DeltaProbe)
 	}
 }
 
@@ -733,10 +729,6 @@ int Platform::GetZProbeReading() const
 			// We assume that zProbeOnFilter and zProbeOffFilter average the same number of readings.
 			// Because of noise, it is possible to get a negative reading, so allow for this.
 			zProbeVal = (int) (((int32_t) zProbeOnFilter.GetSum() - (int32_t) zProbeOffFilter.GetSum()) / (int)(4 * Z_PROBE_AVERAGE_READINGS));
-			break;
-
-		case 7:		// Delta humming probe
-			zProbeVal = (int) ((zProbeOnFilter.GetSum() + zProbeOffFilter.GetSum()) / (8 * Z_PROBE_AVERAGE_READINGS));	//TODO this is temporary
 			break;
 
 		default:
@@ -830,7 +822,6 @@ const ZProbeParameters& Platform::GetZProbeParameters(int32_t probeType) const
 	case 5:
 		return irZProbeParameters;
 	case 3:
-	case 7:
 		return alternateZProbeParameters;
 	case 4:
 	case 6:
@@ -850,7 +841,6 @@ void Platform::SetZProbeParameters(int32_t probeType, const ZProbeParameters& pa
 		break;
 
 	case 3:
-	case 7:
 		alternateZProbeParameters = params;
 		break;
 
@@ -891,7 +881,7 @@ bool Platform::ProgramZProbe(GCodeBuffer& gb, StringRef& reply)
 // Set the state of the Z probe modulation pin
 void Platform::SetZProbeModState(bool b) const
 {
-	WriteDigital(zProbeModulationPin, b);
+	IoPort::WriteDigital(zProbeModulationPin, b);
 }
 
 // Return true if we are using a bed probe to home Z
@@ -903,10 +893,10 @@ bool Platform::HomingZWithProbe() const
 // Check the prerequisites for updating the main firmware. Return True if satisfied, else print as message and return false.
 bool Platform::CheckFirmwareUpdatePrerequisites()
 {
-	FileStore * const firmwareFile = GetFileStore(GetSysDir(), IAP_FIRMWARE_FILE, false);
+	FileStore * const firmwareFile = GetFileStore(GetSysDir(), IAP_FIRMWARE_FILE, OpenMode::read);
 	if (firmwareFile == nullptr)
 	{
-		MessageF(GENERIC_MESSAGE, "Error: Firmware binary \"%s\" not found\n", IAP_FIRMWARE_FILE);
+		MessageF(ErrorMessage, "Firmware binary \"%s\" not found\n", IAP_FIRMWARE_FILE);
 		return false;
 	}
 
@@ -921,13 +911,13 @@ bool Platform::CheckFirmwareUpdatePrerequisites()
 #endif
 			)
 	{
-		MessageF(GENERIC_MESSAGE, "Error: Firmware binary \"%s\" is not valid for this electronics\n", IAP_FIRMWARE_FILE);
+		MessageF(ErrorMessage, "Firmware binary \"%s\" is not valid for this electronics\n", IAP_FIRMWARE_FILE);
 		return false;
 	}
 
 	if (!GetMassStorage()->FileExists(GetSysDir(), IAP_UPDATE_FILE))
 	{
-		MessageF(GENERIC_MESSAGE, "Error: In-application programming binary \"%s\" not found\n", IAP_UPDATE_FILE);
+		MessageF(ErrorMessage, "In-application programming binary \"%s\" not found\n", IAP_UPDATE_FILE);
 		return false;
 	}
 
@@ -937,10 +927,10 @@ bool Platform::CheckFirmwareUpdatePrerequisites()
 // Update the firmware. Prerequisites should be checked before calling this.
 void Platform::UpdateFirmware()
 {
-	FileStore * const iapFile = GetFileStore(GetSysDir(), IAP_UPDATE_FILE, false);
+	FileStore * const iapFile = GetFileStore(GetSysDir(), IAP_UPDATE_FILE, OpenMode::read);
 	if (iapFile == nullptr)
 	{
-		MessageF(FIRMWARE_UPDATE_MESSAGE, "IAP not found\n");
+		MessageF(FirmwareUpdateMessage, "IAP not found\n");
 		return;
 	}
 
@@ -983,13 +973,13 @@ void Platform::UpdateFirmware()
 
 			if (rc != FLASH_RC_OK)
 			{
-				MessageF(FIRMWARE_UPDATE_MESSAGE, "Error: Flash write failed, code=%u, address=0x%08x\n", rc, flashAddr);
+				MessageF(FirmwareUpdateErrorMessage, "flash write failed, code=%" PRIu32 ", address=0x%08" PRIx32 "\n", rc, flashAddr);
 				return;
 			}
 			// Verify written data
 			if (memcmp(reinterpret_cast<void *>(flashAddr), data, bytesRead) != 0)
 			{
-				MessageF(FIRMWARE_UPDATE_MESSAGE, "Error: Verify during flash write failed, address=0x%08x\n", flashAddr);
+				MessageF(FirmwareUpdateErrorMessage, "verify during flash write failed, address=0x%08" PRIx32 "\n", flashAddr);
 				return;
 			}
 		}
@@ -1040,13 +1030,13 @@ void Platform::UpdateFirmware()
 
 			if (rc != FLASH_RC_OK)
 			{
-				MessageF(FIRMWARE_UPDATE_MESSAGE, "Error: Flash %s failed, code=%u, address=0x%08x\n", op, rc, flashAddr);
+				MessageF(FirmwareUpdateErrorMessage, "flash %s failed, code=%" PRIu32 ", address=0x%08" PRIx32 "\n", op, rc, flashAddr);
 				return;
 			}
 			// Verify written data
 			if (memcmp(reinterpret_cast<void *>(flashAddr), data, bytesRead) != 0)
 			{
-				MessageF(FIRMWARE_UPDATE_MESSAGE, "Error: Verify during flash write failed, address=0x%08x\n", flashAddr);
+				MessageF(FirmwareUpdateErrorMessage, "verify during flash write failed, address=0x%08" PRIx32 "\n", flashAddr);
 				return;
 			}
 		}
@@ -1064,7 +1054,9 @@ void Platform::UpdateFirmware()
 #endif
 
 	iapFile->Close();
-	Message(FIRMWARE_UPDATE_MESSAGE, "Updating main firmware\n");
+
+	Message(LcdMessage, "Updating main firmware\n");
+	Message(UsbMessage, "Shutting down USB interface to update main firmware. Try reconnecting after 30 seconds.\n");
 
 	// Allow time for the firmware update message to be sent
 	const uint32_t now = millis();
@@ -1109,7 +1101,7 @@ void Platform::UpdateFirmware()
 	}
 
 #ifdef DUET_NG
-	WriteDigital(Z_PROBE_MOD_PIN, false);			// turn the DIAG LED off
+	IoPort::WriteDigital(Z_PROBE_MOD_PIN, false);		// turn the DIAG LED off
 #endif
 
 	wdt_restart(WDT);								// kick the watchdog one last time
@@ -1133,7 +1125,7 @@ void Platform::UpdateFirmware()
 // Send the beep command to the aux channel. There is no flow control on this port, so it can't block for long.
 void Platform::Beep(int freq, int ms)
 {
-	MessageF(AUX_MESSAGE, "{\"beep_freq\":%d,\"beep_length\":%d}\n", freq, ms);
+	MessageF(LcdMessage, "{\"beep_freq\":%d,\"beep_length\":%d}\n", freq, ms);
 }
 
 // Send a short message to the aux channel. There is no flow control on this port, so it can't block for long.
@@ -1145,27 +1137,14 @@ void Platform::SendAuxMessage(const char* msg)
 		buf->copy("{\"message\":");
 		buf->EncodeString(msg, strlen(msg), false, true);
 		buf->cat("}\n");
-		Message(AUX_MESSAGE, buf);
+		Message(LcdMessage, buf);
 	}
-}
-
-// Note: the use of floating point time will cause the resolution to degrade over time.
-// For example, 1ms time resolution will only be available for about half an hour from startup.
-// Personally, I (dc42) would rather just maintain and provide the time in milliseconds in a uint32_t.
-// This would wrap round after about 49 days, but that isn't difficult to handle.
-float Platform::Time()
-{
-	unsigned long now = micros();
-	if (now < lastTimeCall) // Has timer overflowed?
-	{
-		addToTime += ((float) ULONG_MAX) * TIME_FROM_REPRAP;
-	}
-	lastTimeCall = now;
-	return addToTime + TIME_FROM_REPRAP * (float) now;
 }
 
 void Platform::Exit()
 {
+	StopLogging();
+
 	// Close all files
 	for (FileStore*& f : files)
 	{
@@ -1202,14 +1181,16 @@ void Platform::SetEmulating(Compatibility c)
 {
 	if (c != me && c != reprapFirmware && c != marlin)
 	{
-		Message(GENERIC_MESSAGE, "Attempt to emulate unsupported firmware.\n");
-		return;
+		Message(ErrorMessage, "Attempt to emulate unsupported firmware.\n");
 	}
-	if (c == reprapFirmware)
+	else
 	{
-		c = me;
+		if (c == reprapFirmware)
+		{
+			c = me;
+		}
+		compatibility = c;
 	}
-	compatibility = c;
 }
 
 void Platform::UpdateNetworkAddress(byte dst[4], const byte src[4])
@@ -1327,7 +1308,7 @@ void Platform::Spin()
 	(void)FlushMessages();
 
 	// Check the MCU max and min temperatures
-#ifndef __RADDS__
+#if HAS_CPU_TEMP_SENSOR
 	if (cpuTemperatureFilter.IsValid())
 	{
 		const uint32_t currentMcuTemperature = cpuTemperatureFilter.GetSum();
@@ -1416,8 +1397,19 @@ void Platform::Spin()
 	TMC2660::SetDriversPowered(driversPowered);
 #endif
 
-	// Thermostatically-controlled fans (do this after getting TMC driver status)
 	const uint32_t now = millis();
+
+	// Update the time
+	if (realTime != 0)
+	{
+		if (now - timeLastUpdatedMillis >= 1000)
+		{
+			++realTime;							// this assumes that time_t is a seconds-since-epoch counter, which is not guaranteed by the C standard
+			timeLastUpdatedMillis += 1000;
+		}
+	}
+
+	// Thermostatically-controlled fans (do this after getting TMC driver status)
 	if (now - lastFanCheckTime >= FanCheckInterval)
 	{
 		lastFanCheckTime = now;
@@ -1453,7 +1445,7 @@ void Platform::Spin()
 			// Check for a VSSA fault
 			if (vssaSenseWorking && digitalRead(VssaSensePin))
 			{
-				Message(GENERIC_MESSAGE, "Error: VSSA fault, check thermistor wiring\n");
+				Message(ErrorMessage, "VSSA fault, check thermistor wiring\n");
 				reported = true;
 			}
 
@@ -1463,16 +1455,6 @@ void Platform::Spin()
 			}
 		}
 #endif
-	}
-
-	// Update the time
-	if (realTime != 0)
-	{
-		if (millis() - timeLastUpdatedMillis >= 1000)
-		{
-			++realTime;							// this assumes that time_t is a seconds-since-epoch counter, which is not guaranteed by the C standard
-			timeLastUpdatedMillis += 1000;
-		}
 	}
 
 #ifdef DUET_NG
@@ -1531,33 +1513,13 @@ void Platform::Spin()
 	}
 #endif
 
-	// Filament sensors
-	for (size_t extruder = 0; extruder < MaxExtruders; ++extruder)
+	// Flush the log file it it is time. This may take some time, so do it last.
+	if (logger != nullptr)
 	{
-		if (filamentSensors[extruder] != nullptr)
+		if (now - lastLogFlushTime >= LogFlushInterval)
 		{
-			GCodes& gCodes = reprap.GetGCodes();
-			const float extrusionCommanded = (float)reprap.GetMove().GetAccumulatedExtrusion(extruder)/driveStepsPerUnit[extruder + gCodes.GetTotalAxes()];
-																													// get and clear the Move extrusion commanded
-			if (reprap.GetPrintMonitor().IsPrinting() && !gCodes.IsPausing() && !gCodes.IsResuming() && !gCodes.IsPaused())
-			{
-				const FilamentSensorStatus fstat = filamentSensors[extruder]->Check(extrusionCommanded);
-				if (fstat != FilamentSensorStatus::ok && extrusionCommanded > 0.0)
-				{
-					if (reprap.Debug(moduleFilamentSensors))
-					{
-						debugPrintf("Filament error: extruder %u reports %s\n", extruder, FilamentSensor::GetErrorMessage(fstat));
-					}
-					else
-					{
-						gCodes.FilamentError(extruder, fstat);
-					}
-				}
-			}
-			else
-			{
-				filamentSensors[extruder]->Clear();
-			}
+			logger->Flush();
+			lastLogFlushTime = now;
 		}
 	}
 
@@ -1581,21 +1543,22 @@ void Platform::ReportDrivers(uint16_t whichDrivers, const char* text, bool& repo
 			}
 			whichDrivers >>= 1;
 		}
-		MessageF(GENERIC_MESSAGE, "%s\n", scratchString);
+		MessageF(GenericMessage, "%s\n", scratchString.Pointer());
 		reported = true;
 	}
 }
 
 // Configure auto save on power fail
-void Platform::ConfigureAutoSave(GCodeBuffer& gb, StringRef& reply, bool& error)
+bool Platform::ConfigureAutoSave(GCodeBuffer& gb, StringRef& reply)
 {
 	bool seen = false;
 	float autoSaveVoltages[3];
 	if (gb.TryGetFloatArray('S', 3, autoSaveVoltages, reply, seen))
 	{
-		error = true;
+		return true;
 	}
-	else if (seen)
+
+	if (seen)
 	{
 		autoSaveEnabled = (autoSaveVoltages[0] >= 5.0 && autoSaveVoltages[1] > autoSaveVoltages[0] && autoSaveVoltages[2] > autoSaveVoltages[1]);
 		if (autoSaveEnabled)
@@ -1612,9 +1575,12 @@ void Platform::ConfigureAutoSave(GCodeBuffer& gb, StringRef& reply, bool& error)
 	else
 	{
 		reply.printf(" Auto shutdown at %.1fV, save/pause at %.1fV, resume at %.1fV",
-			AdcReadingToPowerVoltage(autoShutdownReading), AdcReadingToPowerVoltage(autoPauseReading), AdcReadingToPowerVoltage(autoResumeReading));
+			(double)AdcReadingToPowerVoltage(autoShutdownReading), (double)AdcReadingToPowerVoltage(autoPauseReading), (double)AdcReadingToPowerVoltage(autoResumeReading));
 	}
+	return false;
 }
+
+#endif
 
 // Save some resume information
 bool Platform::WriteFanSettings(FileStore *f) const
@@ -1627,14 +1593,12 @@ bool Platform::WriteFanSettings(FileStore *f) const
 	return ok;
 }
 
-#endif
-
 float Platform::AdcReadingToCpuTemperature(uint32_t adcVal) const
 {
 	float voltage = (float)adcVal * (3.3/(float)(4096 * ThermistorAverageReadings));
-#ifdef DUET_NG
+#if SAM4E
 	return (voltage - 1.44) * (1000.0/4.7) + 27.0 + mcuTemperatureAdjust;			// accuracy at 27C is +/-13C
-#else
+#elif SAM3XA
 	return (voltage - 0.8) * (1000.0/2.65) + 27.0 + mcuTemperatureAdjust;			// accuracy at 27C is +/-45C
 #endif
 }
@@ -1656,7 +1620,7 @@ void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 			{
 				reason |= (uint16_t)SoftwareResetReason::inUsbOutput;	// if we are resetting because we are stuck in a Spin function, record whether we are trying to send to USB
 			}
-#if !defined(DUET_NG) && !defined(__RADDS__)
+#if HAS_LWIP_NETWORKING
 			if (reprap.GetNetwork().InLwip())
 			{
 				reason |= (uint16_t)SoftwareResetReason::inLwipSpin;
@@ -1678,7 +1642,7 @@ void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 		size_t slot = SoftwareResetData::numberOfSlots;
 		SoftwareResetData srdBuf[SoftwareResetData::numberOfSlots];
 
-#ifdef DUET_NG
+#if SAM4E
 		if (flash_read_user_signature(reinterpret_cast<uint32_t*>(srdBuf), sizeof(srdBuf)/sizeof(uint32_t)) == FLASH_RC_OK)
 #else
 		DueFlashStorage::read(SoftwareResetData::nvAddress, srdBuf, sizeof(srdBuf));
@@ -1693,7 +1657,7 @@ void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 		if (slot == SoftwareResetData::numberOfSlots)
 		{
 			// No free slots, so erase the area
-#ifdef DUET_NG
+#if SAM4E
 			flash_erase_user_signature();
 #endif
 			memset(srdBuf, 0xFF, sizeof(srdBuf));
@@ -1716,7 +1680,7 @@ void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 		}
 
 		// Save diagnostics data to Flash
-#ifdef DUET_NG
+#if SAM4E
 		flash_write_user_signature(srdBuf, sizeof(srdBuf)/sizeof(uint32_t));
 #else
 		DueFlashStorage::write(SoftwareResetData::nvAddress, srdBuf, sizeof(srdBuf));
@@ -1731,7 +1695,7 @@ void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 //*****************************************************************************************************************
 // Interrupts
 
-#if !defined(DUET_NG) && !defined(__RADDS__)
+#if HAS_LWIP_NETWORKING
 void NETWORK_TC_HANDLER()
 {
 	tc_get_status(NETWORK_TC, NETWORK_TC_CHAN);
@@ -1756,7 +1720,7 @@ void Platform::InitialiseInterrupts()
 	// Set the tick interrupt to the highest priority. We need to to monitor the heaters and kick the watchdog.
 	NVIC_SetPriority(SysTick_IRQn, NvicPrioritySystick);	// set priority for tick interrupts
 
-#ifdef DUET_NG
+#if SAM4E
 	NVIC_SetPriority(UART0_IRQn, NvicPriorityUart);			// set priority for UART interrupt - must be higher than step interrupt
 #else
 	NVIC_SetPriority(UART_IRQn, NvicPriorityUart);			// set priority for UART interrupt - must be higher than step interrupt
@@ -1774,7 +1738,7 @@ void Platform::InitialiseInterrupts()
 	NVIC_SetPriority(STEP_TC_IRQN, NvicPriorityStep);		// set high priority for this IRQ; it's time-critical
 	NVIC_EnableIRQ(STEP_TC_IRQN);
 
-#if !defined(DUET_NG) && !defined(__RADDS__)
+#if HAS_LWIP_NETWORKING
 	// Timer interrupt to keep the networking timers running (called at 16Hz)
 	pmc_enable_periph_clk((uint32_t) NETWORK_TC_IRQN);
 	tc_init(NETWORK_TC, NETWORK_TC_CHAN, TC_CMR_WAVE | TC_CMR_WAVSEL_UP_RC | TC_CMR_TCCLKS_TIMER_CLOCK2);
@@ -1799,6 +1763,12 @@ void Platform::InitialiseInterrupts()
 	NVIC_SetPriority(PIOE_IRQn, NvicPriorityPins);
 #endif
 
+#if SAM3XA
+	NVIC_SetPriority(UOTGHS_IRQn, NvicPriorityUSB);
+#endif
+#if SAM4E
+	NVIC_SetPriority(UDP_IRQn, NvicPriorityUSB);
+#endif
 	NVIC_SetPriority(TWI1_IRQn, NvicPriorityTwi);
 
 	// Interrupt for 4-pin PWM fan sense line
@@ -1814,7 +1784,7 @@ void Platform::InitialiseInterrupts()
 	// Set up the timeout of the regulator watchdog, and set up the backup watchdog if there is one
 	// The clock frequency for both watchdogs is 32768/128 = 256Hz
 	const uint16_t timeout = 32768/128;												// set watchdog timeout to 1 second (max allowed value is 4095 = 16 seconds)
-	wdt_init(WDT, WDT_MR_WDRSTEN, timeout,timeout);									// reset the processor on a watchdog fault
+	wdt_init(WDT, WDT_MR_WDRSTEN, timeout, timeout);								// reset the processor on a watchdog fault
 
 	active = true;							// this enables the tick interrupt, which keeps the watchdog happy
 }
@@ -1913,10 +1883,12 @@ void Platform::Diagnostics(MessageType mtype)
 
 	// Print memory stats and error codes to USB and copy them to the current webserver reply
 	const char *ramstart =
-#ifdef DUET_NG
+#if SAM4E
 			(char *) 0x20000000;
-#else
+#elif SAM3XA
 			(char *) 0x20070000;
+#else
+# error
 #endif
 	const struct mallinfo mi = mallinfo();
 	MessageF(mtype, "Static ram used: %d\n", &_end - ramstart);
@@ -1924,13 +1896,13 @@ void Platform::Diagnostics(MessageType mtype)
 	MessageF(mtype, "Recycled dynamic ram: %d\n", mi.fordblks);
 	uint32_t currentStack, maxStack, neverUsed;
 	GetStackUsage(&currentStack, &maxStack, &neverUsed);
-	MessageF(mtype, "Stack ram used: %u current, %u maximum\n", currentStack, maxStack);
-	MessageF(mtype, "Never used ram: %u\n", neverUsed);
+	MessageF(mtype, "Stack ram used: %" PRIu32 " current, %" PRIu32 " maximum\n", currentStack, maxStack);
+	MessageF(mtype, "Never used ram: %" PRIu32 "\n", neverUsed);
 
 	// Show the up time and reason for the last reset
-	const uint32_t now = (uint32_t)Time();		// get up time in seconds
+	const uint32_t now = (uint32_t)(millis64()/1000u);		// get up time in seconds
 	const char* resetReasons[8] = { "power up", "backup", "watchdog", "software",
-#ifdef DUET_NG
+#if SAM4E
 	// On the SAM4E a watchdog reset may be reported as a user reset because of the capacitor on the NRST pin
 									"reset button or watchdog",
 #else
@@ -1947,7 +1919,7 @@ void Platform::Diagnostics(MessageType mtype)
 		memset(srdBuf, 0, sizeof(srdBuf));
 		int slot = -1;
 
-#ifdef DUET_NG
+#if SAM4E
 		// Work around bug in ASF flash library: flash_read_user_signature calls a RAMFUNC without disabling interrupts first.
 		// This caused a crash (watchdog timeout) sometimes if we run M122 while a print is in progress
 		const irqflags_t flags = cpu_irq_save();
@@ -1973,12 +1945,13 @@ void Platform::Diagnostics(MessageType mtype)
 			const char* const reasonText = (reason == (uint32_t)SoftwareResetReason::user) ? "User"
 											: (reason == (uint32_t)SoftwareResetReason::NMI) ? "NMI"
 												: (reason == (uint32_t)SoftwareResetReason::hardFault) ? "Hard fault"
-													: (reason == (uint32_t)SoftwareResetReason::otherFault) ? "Other fault"
-														: "Unknown";
-			MessageF(mtype, "%s, spinning module %s, available RAM %u bytes (slot %d)\n",
+													: (reason == (uint32_t)SoftwareResetReason::stuckInSpin) ? "Stuck in spin loop"
+														: (reason == (uint32_t)SoftwareResetReason::otherFault) ? "Other fault"
+															: "Unknown";
+			MessageF(mtype, "%s, spinning module %s, available RAM %" PRIu32 " bytes (slot %d)\n",
 					reasonText, moduleName[srdBuf[slot].resetReason & 0x0F], srdBuf[slot].neverUsedRam, slot);
 			// Our format buffer is only 256 characters long, so the next 2 lines must be written separately
-			MessageF(mtype, "Software reset code 0x%04x, HFSR 0x%08x, CFSR 0x%08x, ICSR 0x%08x, BFAR 0x%08x, SP 0x%08x\n",
+			MessageF(mtype, "Software reset code 0x%04x, HFSR 0x%08" PRIx32 ", CFSR 0x%08" PRIx32 ", ICSR 0x%08" PRIx32 ", BFAR 0x%08" PRIx32 ", SP 0x%08" PRIx32 "\n",
 				srdBuf[slot].resetReason, srdBuf[slot].hfsr, srdBuf[slot].cfsr, srdBuf[slot].icsr, srdBuf[slot].bfar, srdBuf[slot].sp);
 			if (srdBuf[slot].sp != 0xFFFFFFFF)
 			{
@@ -1986,7 +1959,7 @@ void Platform::Diagnostics(MessageType mtype)
 				scratchString.Clear();
 				for (size_t i = 0; i < ARRAY_SIZE(srdBuf[slot].stack); ++i)
 				{
-					scratchString.catf(" %08x", srdBuf[slot].stack[i]);
+					scratchString.catf(" %08" PRIx32 "", srdBuf[slot].stack[i]);
 				}
 				MessageF(mtype, "Stack:%s\n", scratchString.Pointer());
 			}
@@ -1998,7 +1971,7 @@ void Platform::Diagnostics(MessageType mtype)
 	}
 
 	// Show the current error codes
-	MessageF(mtype, "Error status: %u\n", errorCodeBits);
+	MessageF(mtype, "Error status: %" PRIu32 "\n", errorCodeBits);
 
 	// Show the number of free entries in the file table
 	unsigned int numFreeFiles = 0;
@@ -2012,27 +1985,27 @@ void Platform::Diagnostics(MessageType mtype)
 	MessageF(mtype, "Free file entries: %u\n", numFreeFiles);
 
 	// Show the HSMCI CD pin and speed
-#if defined( __RADDS__) || defined(__ALLIGATOR__)
-	MessageF(mtype, "SD card 0 %s\n", (sd_mmc_card_detected(0) ? "detected" : "not detected"));
+#if HAS_HIGH_SPEED_SD
+	MessageF(mtype, "SD card 0 %s, interface speed: %.1fMBytes/sec\n", (sd_mmc_card_detected(0) ? "detected" : "not detected"), (double)((float)hsmci_get_speed()/1000000.0));
 #else
-	MessageF(mtype, "SD card 0 %s, interface speed: %.1fMBytes/sec\n", (sd_mmc_card_detected(0) ? "detected" : "not detected"), (float)hsmci_get_speed()/1000000.0);
+	MessageF(mtype, "SD card 0 %s\n", (sd_mmc_card_detected(0) ? "detected" : "not detected"));
 #endif
 
 	// Show the longest SD card write time
-	MessageF(mtype, "SD card longest block write time: %.1fms\n", FileStore::GetAndClearLongestWriteTime());
+	MessageF(mtype, "SD card longest block write time: %.1fms\n", (double)FileStore::GetAndClearLongestWriteTime());
 
-#if !defined( __RADDS__)
+#if HAS_CPU_TEMP_SENSOR
 	// Show the MCU temperatures
 	const uint32_t currentMcuTemperature = cpuTemperatureFilter.GetSum();
 	MessageF(mtype, "MCU temperature: min %.1f, current %.1f, max %.1f\n",
-				AdcReadingToCpuTemperature(lowestMcuTemperature), AdcReadingToCpuTemperature(currentMcuTemperature), AdcReadingToCpuTemperature(highestMcuTemperature));
+		(double)AdcReadingToCpuTemperature(lowestMcuTemperature), (double)AdcReadingToCpuTemperature(currentMcuTemperature), (double)AdcReadingToCpuTemperature(highestMcuTemperature));
 	lowestMcuTemperature = highestMcuTemperature = currentMcuTemperature;
 #endif
 
 #ifdef DUET_NG
 	// Show the supply voltage
-	MessageF(mtype, "Supply voltage: min %.1f, current %.1f, max %.1f, under voltage events: %u, over voltage events: %u\n",
-				AdcReadingToPowerVoltage(lowestVin), AdcReadingToPowerVoltage(currentVin), AdcReadingToPowerVoltage(highestVin),
+	MessageF(mtype, "Supply voltage: min %.1f, current %.1f, max %.1f, under voltage events: %" PRIu32 ", over voltage events: %" PRIu32 "\n",
+		(double)AdcReadingToPowerVoltage(lowestVin), (double)AdcReadingToPowerVoltage(currentVin), (double)AdcReadingToPowerVoltage(highestVin),
 				numUnderVoltageEvents, numOverVoltageEvents);
 	lowestVin = highestVin = currentVin;
 
@@ -2059,15 +2032,6 @@ void Platform::Diagnostics(MessageType mtype)
 				);
 	}
 #endif
-
-	// Filament sensors
-	for (size_t i = 0; i < MaxExtruders; ++i)
-	{
-		if (filamentSensors[i] != nullptr)
-		{
-			filamentSensors[i]->Diagnostics(mtype, i);
-		}
-	}
 
 	// Show current RTC time
 	Message(mtype, "Date/time: ");
@@ -2155,15 +2119,15 @@ void Platform::DiagnosticTest(int d)
 			const uint32_t now2 = Platform::GetInterruptClocks();
 			const uint32_t num2a = isqrt64((uint64_t)num2 * num2);
 			const uint32_t tim2 = Platform::GetInterruptClocks() - now2;
-			MessageF(GENERIC_MESSAGE, "Square roots: 64-bit %.1fus %s, 32-bit %.1fus %s\n",
-					(float)(tim1 * 1000000)/DDA::stepClockRate, (num1a == num1) ? "ok" : "ERROR",
-							(float)(tim2 * 1000000)/DDA::stepClockRate, (num2a == num2) ? "ok" : "ERROR");
+			MessageF(GenericMessage, "Square roots: 64-bit %.1fus %s, 32-bit %.1fus %s\n",
+					(double)(tim1 * 1000000)/DDA::stepClockRate, (num1a == num1) ? "ok" : "ERROR",
+							(double)(tim2 * 1000000)/DDA::stepClockRate, (num2a == num2) ? "ok" : "ERROR");
 		}
 		break;
 
 #ifdef DUET_NG
 	case (int)DiagnosticTestType::PrintExpanderStatus:
-		MessageF(GENERIC_MESSAGE, "Expander status %04X\n", DuetExpansion::DiagnosticRead());
+		MessageF(GenericMessage, "Expander status %04X\n", DuetExpansion::DiagnosticRead());
 		break;
 #endif
 
@@ -2190,15 +2154,16 @@ void Platform::GetStackUsage(uint32_t* currentStack, uint32_t* maxStack, uint32_
 	if (neverUsed != nullptr) { *neverUsed = stack_lwm - heapend; }
 }
 
-void Platform::ClassReport(float &lastTime)
+void Platform::ClassReport(uint32_t &lastTime)
 {
 	const Module spinningModule = reprap.GetSpinningModule();
 	if (reprap.Debug(spinningModule))
 	{
-		if (Time() - lastTime >= LONG_TIME)
+		const uint32_t now = millis();
+		if (now - lastTime >= LongTime)
 		{
-			lastTime = Time();
-			MessageF(HOST_MESSAGE, "Class %s spinning.\n", moduleName[spinningModule]);
+			lastTime = now;
+			MessageF(UsbMessage, "Class %s spinning\n", moduleName[spinningModule]);
 		}
 	}
 }
@@ -2225,8 +2190,8 @@ void Platform::SetHeater(size_t heater, float power)
 {
 	if (heatOnPins[heater] != NoPin)
 	{
-		uint16_t freq = (reprap.GetHeat().UseSlowPwm(heater)) ? SlowHeaterPwmFreq : NormalHeaterPwmFreq;
-		WriteAnalog(heatOnPins[heater], (HEAT_ON) ? power : 1.0 - power, freq);
+		const uint16_t freq = (reprap.GetHeat().UseSlowPwm(heater)) ? SlowHeaterPwmFreq : NormalHeaterPwmFreq;
+		IoPort::WriteAnalog(heatOnPins[heater], (HEAT_ON) ? power : 1.0 - power, freq);
 	}
 }
 
@@ -2266,7 +2231,7 @@ EndStopHit Platform::Stopped(size_t drive) const
 		{
 			// Endstop not used for an axis, so no configuration data available.
 			// To allow us to see its status in DWC, pretend it is configured as a high-end active high endstop.
-			if (ReadPin(endStopPins[drive]))
+			if (IoPort::ReadPin(endStopPins[drive]))
 			{
 				return EndStopHit::highHit;
 			}
@@ -2279,7 +2244,7 @@ EndStopHit Platform::Stopped(size_t drive) const
 				return GetZProbeResult();			// using the Z probe as a low homing stop for this axis, so just get its result
 			}
 		}
-		else if (ReadPin(endStopPins[drive]) == endStopLogicLevel[drive])
+		else if (IoPort::ReadPin(endStopPins[drive]) == endStopLogicLevel[drive])
 		{
 			return (endStopType[drive] == EndStopType::highEndStop) ? EndStopHit::highHit : EndStopHit::lowHit;
 		}
@@ -2294,7 +2259,7 @@ uint32_t Platform::GetAllEndstopStates() const
 	for (unsigned int drive = 0; drive < DRIVES; ++drive)
 	{
 		const Pin pin = endStopPins[drive];
-		if (pin != NoPin && ReadPin(pin))
+		if (pin != NoPin && IoPort::ReadPin(pin))
 		{
 			rslt |= (1 << drive);
 		}
@@ -2431,6 +2396,16 @@ void Platform::DisableDrive(size_t drive)
 	}
 }
 
+// Disable all drives
+void Platform::DisableAllDrives()
+{
+	for (size_t drive = 0; drive < DRIVES; drive++)
+	{
+		SetDriverCurrent(drive, 0.0, false);
+		DisableDriver(drive);
+	}
+}
+
 // Set drives to idle hold if they are enabled. If a drive is disabled, leave it alone.
 // Must not be called from an ISR, or with interrupts disabled.
 void Platform::SetDriversIdle()
@@ -2500,9 +2475,36 @@ void Platform::UpdateMotorCurrent(size_t driver)
 		{
 			TMC2660::SetCurrent(driver, current);
 		}
-		// else we can't set the current
-#elif defined (__RADDS__)
-		// we can't set the current on RADDS
+#elif defined (DUET_06_085)
+		unsigned short pot = (unsigned short)((0.256*current*8.0*senseResistor + maxStepperDigipotVoltage/2)/maxStepperDigipotVoltage);
+		if (driver < 4)
+		{
+			mcpDuet.setNonVolatileWiper(potWipes[driver], pot);
+			mcpDuet.setVolatileWiper(potWipes[driver], pot);
+		}
+		else
+		{
+			if (board == BoardType::Duet_085)
+			{
+				// Extruder 0 is on DAC channel 0
+				if (driver == 4)
+				{
+					const float dacVoltage = max<float>(current * 0.008 * senseResistor + stepperDacVoltageOffset, 0.0);	// the voltage we want from the DAC relative to its minimum
+					const float dac = dacVoltage/stepperDacVoltageRange;
+					AnalogOut(DAC0, dac);
+				}
+				else
+				{
+					mcpExpansion.setNonVolatileWiper(potWipes[driver-1], pot);
+					mcpExpansion.setVolatileWiper(potWipes[driver-1], pot);
+				}
+			}
+			else if (driver < 8)		// on a Duet 0.6 we have a maximum of 8 drives
+			{
+				mcpExpansion.setNonVolatileWiper(potWipes[driver], pot);
+				mcpExpansion.setVolatileWiper(potWipes[driver], pot);
+			}
+		}
 #elif defined(__ALLIGATOR__)
 		// Alligator SPI DAC current
 		if (driver < 4)  // Onboard DAC
@@ -2514,43 +2516,7 @@ void Platform::UpdateMotorCurrent(size_t driver)
 			dacPiggy.setChannel(7-driver, current * 0.102);
 		}
 #else
-		unsigned short pot = (unsigned short)((0.256*current*8.0*senseResistor + maxStepperDigipotVoltage/2)/maxStepperDigipotVoltage);
-		if (driver < 4)
-		{
-			mcpDuet.setNonVolatileWiper(potWipes[driver], pot);
-			mcpDuet.setVolatileWiper(potWipes[driver], pot);
-		}
-		else
-		{
-# ifndef DUET_NG
-			if (board == BoardType::Duet_085)
-			{
-# endif
-				// Extruder 0 is on DAC channel 0
-				if (driver == 4)
-				{
-					const float dacVoltage = max<float>(current * 0.008 * senseResistor + stepperDacVoltageOffset, 0.0);	// the voltage we want from the DAC relative to its minimum
-					const float dac = dacVoltage/stepperDacVoltageRange;
-# ifdef DUET_NG
-					AnalogOut(DAC1, dac);
-# else
-					AnalogOut(DAC0, dac);
-# endif
-				}
-				else
-				{
-					mcpExpansion.setNonVolatileWiper(potWipes[driver-1], pot);
-					mcpExpansion.setVolatileWiper(potWipes[driver-1], pot);
-				}
-# ifndef DUET_NG
-			}
-			else if (driver < 8)		// on a Duet 0.6 we have a maximum of 8 drives
-			{
-				mcpExpansion.setNonVolatileWiper(potWipes[driver], pot);
-				mcpExpansion.setVolatileWiper(potWipes[driver], pot);
-			}
-# endif
-		}
+		// otherwise we can't set the motor current
 #endif
 	}
 }
@@ -2596,14 +2562,15 @@ bool Platform::SetDriverMicrostepping(size_t driver, int microsteps, int mode)
 		}
 		else
 		{
-#elif defined(__ALLIGATOR__)
-		return Microstepping::Set(driver, microsteps); // no mode in Alligator board
-#endif
 			// Other drivers only support x16 microstepping.
 			// We ignore the interpolation on/off parameter so that e.g. M350 I1 E16:128 won't give an error if E1 supports interpolation but E0 doesn't.
 			return microsteps == 16;
-#if defined(DUET_NG)
 		}
+#elif defined(__ALLIGATOR__)
+		return Microstepping::Set(driver, microsteps); // no mode in Alligator board
+#else
+		// Assume only x16 microstepping supported
+		return microsteps == 16;
 #endif
 	}
 	return false;
@@ -2637,13 +2604,16 @@ unsigned int Platform::GetDriverMicrostepping(size_t driver, int mode, bool& int
 	{
 		return TMC2660::GetMicrostepping(driver, mode, interpolation);
 	}
-#elif defined(__ALLIGATOR__)
-	interpolation = false;
-	return Microstepping::Read(driver); // no mode, no interpolation for Alligator
-#endif
 	// On-board drivers only support x16 microstepping without interpolation
 	interpolation = false;
 	return 16;
+#elif defined(__ALLIGATOR__)
+	interpolation = false;
+	return Microstepping::Read(driver); // no mode, no interpolation for Alligator
+#else
+	interpolation = false;
+	return 16;
+#endif
 }
 
 // Get the microstepping for an axis or extruder
@@ -2743,7 +2713,7 @@ void Platform::SetFanValue(size_t fan, float speed)
 	}
 }
 
-#if !defined(DUET_NG) && !defined(__RADDS__) && !defined(__ALLIGATOR__)
+#if defined(DUET_06_085)
 
 // Enable or disable the fan that shares its PWM pin with the last heater. Called when we disable or enable the last heater.
 void Platform::EnableSharedFan(bool enable)
@@ -2769,12 +2739,12 @@ float Platform::GetFanRPM() const
 
 bool Platform::FansHardwareInverted(size_t fanNumber) const
 {
-#if defined(DUET_NG) || defined(__RADDS__) || defined(__ALLIGATOR__)
-	return false;
-#else
+#if defined(DUET_06_085)
 	// The cooling fan output pin gets inverted on a Duet 0.6 or 0.7.
 	// We allow a second fan controlled by a mosfet on the PC4 pin, which is not inverted.
 	return fanNumber == 0 && (board == BoardType::Duet_06 || board == BoardType::Duet_07);
+#else
+	return false;
 #endif
 }
 
@@ -2787,12 +2757,12 @@ void Platform::InitFans()
 
 	if (NUM_FANS > 1)
 	{
-#if defined(DUET_NG) || defined(__RADDS__) || defined(__ALLIGATOR__)
-		// Set fan 1 to be thermostatic by default, monitoring all heaters except the default bed heater
-		fans[1].SetHeatersMonitored(((1 << Heaters) - 1) & ~(1 << DefaultBedHeater));
+#if defined(DUET_06_085)
+		// Fan 1 on the Duet 0.8.5 shares its control pin with heater 6. Set it full on to make sure the heater (if present) is off.
 		fans[1].SetValue(1.0);												// set it full on
 #else
-		// Fan 1 on the Duet 0.8.5 shares its control pin with heater 6. Set it full on to make sure the heater (if present) is off.
+		// Set fan 1 to be thermostatic by default, monitoring all heaters except the default bed heater
+		fans[1].SetHeatersMonitored(((1 << Heaters) - 1) & ~(1 << DefaultBedHeater));
 		fans[1].SetValue(1.0);												// set it full on
 #endif
 	}
@@ -2814,7 +2784,7 @@ void Platform::SetMACAddress(uint8_t mac[])
 
 //-----------------------------------------------------------------------------------------------------
 
-FileStore* Platform::GetFileStore(const char* directory, const char* fileName, bool write)
+FileStore* Platform::GetFileStore(const char* directory, const char* fileName, OpenMode mode)
 {
 	if (!fileStructureInitialised)
 	{
@@ -2825,7 +2795,7 @@ FileStore* Platform::GetFileStore(const char* directory, const char* fileName, b
 	{
 		if (!files[i]->inUse)
 		{
-			if (files[i]->Open(directory, fileName, write))
+			if (files[i]->Open(directory, fileName, mode))
 			{
 				files[i]->inUse = true;
 				return files[i];
@@ -2836,7 +2806,7 @@ FileStore* Platform::GetFileStore(const char* directory, const char* fileName, b
 			}
 		}
 	}
-	Message(HOST_MESSAGE, "Max open file count exceeded.\n");
+	Message(ErrorMessage, "Max open file count exceeded.\n");
 	return nullptr;
 }
 
@@ -2895,15 +2865,37 @@ void Platform::AppendAuxReply(OutputBuffer *reply)
 	}
 }
 
-void Platform::Message(MessageType type, const char *message)
+// Send the specified message to the specified destinations. The Error and Warning flags have already been handled.
+void Platform::RawMessage(MessageType type, const char *message)
 {
-	switch (type)
+	// Deal with logging
+	if ((type & LogMessage) != 0 && logger != nullptr)
 	{
-	case AUX_MESSAGE:
-		AppendAuxReply(message);
-		break;
+		logger->LogMessage(realTime, message);
+	}
 
-	case AUX2_MESSAGE:
+	// Send the nessage to the destinations
+	if ((type & ImmediateLcdMessage) != 0)
+	{
+		SendAuxMessage(message);
+	}
+	else if ((type & LcdMessage) != 0)
+	{
+		AppendAuxReply(message);
+	}
+
+	if ((type & HttpMessage) != 0)
+	{
+		reprap.GetNetwork().HandleHttpGCodeReply(message);
+	}
+
+	if ((type & TelnetMessage) != 0)
+	{
+		reprap.GetNetwork().HandleTelnetGCodeReply(message);
+	}
+
+	if ((type & AuxMessage) != 0)
+	{
 #ifdef SERIAL_AUX2_DEVICE
 		// Message that is to be sent to the second auxiliary device (blocking)
 		if (!aux2Output->IsEmpty())
@@ -2918,15 +2910,16 @@ void Platform::Message(MessageType type, const char *message)
 			SERIAL_AUX2_DEVICE.flush();
 		}
 #endif
-		break;
+	}
 
-	case DEBUG_MESSAGE:
+	if ((type & BlockingUsbMessage) != 0)
+	{
 		// Debug messages in blocking mode - potentially DANGEROUS, use with care!
 		SERIAL_MAIN_DEVICE.write(message);
 		SERIAL_MAIN_DEVICE.flush();
-		break;
-
-	case HOST_MESSAGE:
+	}
+	else if ((type & UsbMessage) != 0)
+	{
 		// Message that is to be sent via the USB line (non-blocking)
 #if SUPPORT_SCANNER
 		if (!reprap.GetScanner().IsRegistered() || reprap.GetScanner().DoingGCodes())
@@ -2947,101 +2940,94 @@ void Platform::Message(MessageType type, const char *message)
 			// Append the message string
 			usbOutputBuffer->cat(message);
 		}
-		break;
-
-	case HTTP_MESSAGE:
-		reprap.GetNetwork().HandleHttpGCodeReply(message);
-		break;
-
-	case TELNET_MESSAGE:
-		reprap.GetNetwork().HandleTelnetGCodeReply(message);
-		break;
-
-	case FIRMWARE_UPDATE_MESSAGE:
-		Message(HOST_MESSAGE, message);			// send message to USB
-		SendAuxMessage(message);				// send message to aux
-		break;
-
-	case GENERIC_MESSAGE:
-		// Message that is to be sent to the web & host. Make this the default one, too.
-	default:
-		Message(HTTP_MESSAGE, message);
-		Message(TELNET_MESSAGE, message);
-		// no break
-	case NETWORK_INFO_MESSAGE:
-		Message(HOST_MESSAGE, message);
-		Message(AUX_MESSAGE, message);
-		break;
 	}
 }
 
+// Note: this overload of Platform::Message does not process the special action flags in the MessageType.
+// Also it treats calls to send a blocking USB message the same as ordinary USB messages,
+// and calls to send an immediate LCD message the same as ordinary LCD messages
 void Platform::Message(const MessageType type, OutputBuffer *buffer)
 {
-	switch (type)
+	// First deal with logging because it doesn't hand on to the buffer
+	if ((type & LogMessage) != 0 && logger != nullptr)
 	{
-	case AUX_MESSAGE:
-		AppendAuxReply(buffer);
-		break;
+		logger->LogMessage(realTime, buffer);
+	}
 
-	case AUX2_MESSAGE:
+	// Now send the message to all the destinations
+	size_t numDestinations = 0;
+	if ((type & (LcdMessage | ImmediateLcdMessage)) != 0)
+	{
+		++numDestinations;
+	}
+	if ((type & (UsbMessage | BlockingUsbMessage)) != 0)
+	{
+		++numDestinations;
+	}
+	if ((type & HttpMessage) != 0)
+	{
+		++numDestinations;
+	}
+	if ((type & TelnetMessage) != 0)
+	{
+		++numDestinations;
+	}
+
 #ifdef SERIAL_AUX2_DEVICE
-		// Send this message to the second UART device
-		aux2Output->Push(buffer);
-#else
-		OutputBuffer::ReleaseAll(buffer);
+	if ((type & AuxMessage) != 0)
+	{
+		++numDestinations;
+	}
 #endif
-		break;
 
-	case DEBUG_MESSAGE:
-		// Probably rarely used, but supported.
-		while (buffer != nullptr)
+	if (numDestinations == 0)
+	{
+		OutputBuffer::ReleaseAll(buffer);
+	}
+	else
+	{
+		buffer->IncreaseReferences(numDestinations - 1);
+
+		if ((type & (LcdMessage | ImmediateLcdMessage)) != 0)
 		{
-			SERIAL_MAIN_DEVICE.write(buffer->Data(), buffer->DataLength());
-			SERIAL_MAIN_DEVICE.flush();
-
-			buffer = OutputBuffer::Release(buffer);
+			AppendAuxReply(buffer);
 		}
-		break;
 
-	case HOST_MESSAGE:
-		if (   !SERIAL_MAIN_DEVICE
+		if ((type & HttpMessage) != 0)
+		{
+			reprap.GetNetwork().HandleHttpGCodeReply(buffer);
+		}
+
+		if ((type & TelnetMessage) != 0)
+		{
+			reprap.GetNetwork().HandleTelnetGCodeReply(buffer);
+		}
+
+#ifdef SERIAL_AUX2_DEVICE
+		if ((type & AuxMessage) != 0)
+		{
+			// Send this message to the second UART device
+			aux2Output->Push(buffer);
+		}
+#endif
+
+		if ((type & (UsbMessage | BlockingUsbMessage)) != 0)
+		{
+			if (   !SERIAL_MAIN_DEVICE
 #if SUPPORT_SCANNER
-			|| (reprap.GetScanner().IsRegistered() && !reprap.GetScanner().DoingGCodes())
+				|| (reprap.GetScanner().IsRegistered() && !reprap.GetScanner().DoingGCodes())
 #endif
-			)
-		{
-			// If the serial USB line is not open, discard the message right away
-			OutputBuffer::ReleaseAll(buffer);
+			   )
+			{
+				// If the serial USB line is not open, discard the message right away
+				OutputBuffer::ReleaseAll(buffer);
+			}
+			else
+			{
+				// Else append incoming data to the stack
+				usbOutput->Push(buffer);
+			}
 		}
-		else
-		{
-			// Else append incoming data to the stack
-			usbOutput->Push(buffer);
-		}
-		break;
-
-	case HTTP_MESSAGE:
-		reprap.GetNetwork().HandleHttpGCodeReply(buffer);
-		break;
-
-	case TELNET_MESSAGE:
-		reprap.GetNetwork().HandleTelnetGCodeReply(buffer);
-		break;
-
-	case GENERIC_MESSAGE:
-		// Message that is to be sent to the web & host.
-		buffer->IncreaseReferences(3);		// This one is handled by three additional destinations
-		Message(HTTP_MESSAGE, buffer);
-		Message(TELNET_MESSAGE, buffer);
-		Message(HOST_MESSAGE, buffer);
-		Message(AUX_MESSAGE, buffer);
-		break;
-
-	default:
-		// Everything else is unsupported (and probably not used)
-		OutputBuffer::ReleaseAll(buffer);
-		MessageF(HOST_MESSAGE, "Error: Unsupported Message call for type %u!\n", type);
-		break;
 	}
 }
 
@@ -3049,22 +3035,46 @@ void Platform::MessageF(MessageType type, const char *fmt, va_list vargs)
 {
 	char formatBuffer[FORMAT_STRING_LENGTH];
 	StringRef formatString(formatBuffer, ARRAY_SIZE(formatBuffer));
-	formatString.vprintf(fmt, vargs);
+	if ((type & ErrorMessageFlag) != 0)
+	{
+		formatString.copy("Error: ");
+		formatString.vcatf(fmt, vargs);
+	}
+	else if ((type & WarningMessageFlag) != 0)
+	{
+		formatString.copy("Warning: ");
+		formatString.vcatf(fmt, vargs);
+	}
+	else
+	{
+		formatString.vprintf(fmt, vargs);
+	}
 
-	Message(type, formatBuffer);
+	RawMessage((MessageType)(type & ~(ErrorMessageFlag | WarningMessageFlag)), formatBuffer);
 }
 
 void Platform::MessageF(MessageType type, const char *fmt, ...)
 {
-	char formatBuffer[FORMAT_STRING_LENGTH];
-	StringRef formatString(formatBuffer, ARRAY_SIZE(formatBuffer));
-
 	va_list vargs;
 	va_start(vargs, fmt);
-	formatString.vprintf(fmt, vargs);
+	MessageF(type, fmt, vargs);
 	va_end(vargs);
+}
 
-	Message(type, formatBuffer);
+void Platform::Message(MessageType type, const char *message)
+{
+	if ((type & (ErrorMessageFlag | WarningMessageFlag)) == 0)
+	{
+		RawMessage(type, message);
+	}
+	else
+	{
+		char formatBuffer[FORMAT_STRING_LENGTH];
+		StringRef formatString(formatBuffer, ARRAY_SIZE(formatBuffer));
+		formatString.copy(((type & ErrorMessageFlag) != 0) ? "Error: " : "Warning: ");
+		formatString.cat(message);
+		RawMessage((MessageType)(type & ~(ErrorMessageFlag | WarningMessageFlag)), formatBuffer);
+	}
 }
 
 // Send a message box, which may require an acknowledgement
@@ -3072,15 +3082,15 @@ void Platform::MessageF(MessageType type, const char *fmt, ...)
 // sParam = 1 As for 0 but display a Close button as well
 // sParam = 2 Display the message box with an OK button, wait for acknowledgement (waiting is set up by the caller)
 // sParam = 3 As for 2 but also display a Cancel button
-void Platform::SendAlert(MessageType mt, const char *message, const char *title, int sParam, float tParam, bool zParam)
+void Platform::SendAlert(MessageType mt, const char *message, const char *title, int sParam, float tParam, AxesBitmap controls)
 {
 	switch (mt)
 	{
-	case HTTP_MESSAGE:
-	case AUX_MESSAGE:
-	case GENERIC_MESSAGE:
+	case HttpMessage:
+	case LcdMessage:
+	case GenericMessage:
 		// Make the RepRap class cache this message until it's picked up by the HTTP clients and/or PanelDue
-		reprap.SetAlert(message, title, sParam, tParam, zParam);
+		reprap.SetAlert(message, title, sParam, tParam, controls);
 		break;
 
 	default:
@@ -3101,14 +3111,65 @@ void Platform::SendAlert(MessageType mt, const char *message, const char *title,
 	}
 }
 
+// Configure logging according to the M929 command received, returning true if error
+bool Platform::ConfigureLogging(GCodeBuffer& gb, StringRef& reply)
+{
+	if (gb.Seen('S'))
+	{
+		StopLogging();
+		if (gb.GetIValue() > 0)
+		{
+			// Start logging
+			if (logger == nullptr)
+			{
+				logger = new Logger();
+			}
+			else
+			{
+				StopLogging();
+			}
+
+			char buf[FILENAME_LENGTH + 1];
+			StringRef filename(buf, ARRAY_SIZE(buf));
+			if (gb.Seen('P'))
+			{
+				if (!gb.GetQuotedString(filename))
+				{
+					reply.copy("Missing filename in M929 command");
+					return true;
+				}
+			}
+			else
+			{
+				filename.copy(DEFAULT_LOG_FILE);
+			}
+			logger->Start(realTime, filename);
+		}
+	}
+	else
+	{
+		reply.printf("Event logging is %s", (logger != nullptr && logger->IsActive()) ? "enabled" : "disabled");
+	}
+	return false;
+}
+
+// This is called form EmergencyStop. It closes the log file and stops logging.
+void Platform::StopLogging()
+{
+	if (logger != nullptr)
+	{
+		logger->Stop(realTime);
+	}
+}
+
 bool Platform::AtxPower() const
 {
-	return ReadPin(ATX_POWER_PIN);
+	return IoPort::ReadPin(ATX_POWER_PIN);
 }
 
 void Platform::SetAtxPower(bool on)
 {
-	WriteDigital(ATX_POWER_PIN, on);
+	IoPort::WriteDigital(ATX_POWER_PIN, on);
 }
 
 
@@ -3200,11 +3261,7 @@ void Platform::SetBoardType(BoardType bt)
 		board = BoardType::DuetWiFi_10;
 #elif defined(DUET_NG) && defined(DUET_ETHERNET)
 		board = BoardType::DuetEthernet_10;
-#elif defined(__RADDS__)
-		board = BoardType::RADDS_15;
-#elif defined(__ALLIGATOR__)
-		board = BoardType::Alligator_2;
-#else
+#elif defined(DUET_06_085)
 		// Determine whether this is a Duet 0.6 or a Duet 0.8.5 board.
 		// If it is a 0.85 board then DAC0 (AKA digital pin 67) is connected to ground via a diode and a 2.15K resistor.
 		// So we enable the pullup (value 100K-150K) on pin 67 and read it, expecting a LOW on a 0.8.5 board and a HIGH on a 0.6 board.
@@ -3212,6 +3269,12 @@ void Platform::SetBoardType(BoardType bt)
 		pinMode(Dac0DigitalPin, INPUT_PULLUP);
 		board = (digitalRead(Dac0DigitalPin)) ? BoardType::Duet_06 : BoardType::Duet_085;
 		pinMode(Dac0DigitalPin, INPUT);			// turn pullup off
+#elif defined(__RADDS__)
+		board = BoardType::RADDS_15;
+#elif defined(__ALLIGATOR__)
+		board = BoardType::Alligator_2;
+#else
+# error Undefined board type
 #endif
 	}
 	else
@@ -3235,14 +3298,16 @@ const char* Platform::GetElectronicsString() const
 	case BoardType::DuetWiFi_10:			return "Duet WiFi 1.0";
 #elif defined(DUET_NG) && defined(DUET_ETHERNET)
 	case BoardType::DuetEthernet_10:		return "Duet Ethernet 1.0";
+#elif defined(DUET_06_085)
+	case BoardType::Duet_06:				return "Duet 0.6";
+	case BoardType::Duet_07:				return "Duet 0.7";
+	case BoardType::Duet_085:				return "Duet 0.85";
 #elif defined(__RADDS__)
 	case BoardType::RADDS_15:				return "RADDS 1.5";
 #elif defined(__ALLIGATOR__)
 	case BoardType::Alligator_2:			return "Alligator r2";
 #else
-	case BoardType::Duet_06:				return "Duet 0.6";
-	case BoardType::Duet_07:				return "Duet 0.7";
-	case BoardType::Duet_085:				return "Duet 0.85";
+# error Undefined board type
 #endif
 	default:								return "Unidentified";
 	}
@@ -3257,25 +3322,27 @@ const char* Platform::GetBoardString() const
 	case BoardType::DuetWiFi_10:			return "duetwifi10";
 #elif defined(DUET_NG) && defined(DUET_ETHERNET)
 	case BoardType::DuetEthernet_10:		return "duetethernet10";
+#elif defined(DUET_06_085)
+	case BoardType::Duet_06:				return "duet06";
+	case BoardType::Duet_07:				return "duet07";
+	case BoardType::Duet_085:				return "duet085";
 #elif defined(__RADDS__)
 	case BoardType::RADDS_15:				return "radds15";
 #elif defined(__ALLIGATOR__)
 	case BoardType::Alligator_2:			return "alligator2";
 #else
-	case BoardType::Duet_06:				return "duet06";
-	case BoardType::Duet_07:				return "duet07";
-	case BoardType::Duet_085:				return "duet085";
+# error Undefined board type
 #endif
 	default:								return "unknown";
 	}
 }
 
 // User I/O and servo support
-bool Platform::GetFirmwarePin(int logicalPin, PinAccess access, Pin& firmwarePin, bool& invert)
+bool Platform::GetFirmwarePin(LogicalPin logicalPin, PinAccess access, Pin& firmwarePin, bool& invert)
 {
 	firmwarePin = NoPin;										// assume failure
 	invert = false;												// this is the common case
-	if (logicalPin < 0 || logicalPin > HighestLogicalPin)
+	if (logicalPin > HighestLogicalPin)
 	{
 		// Pin number out of range, so nothing to do here
 	}
@@ -3299,7 +3366,7 @@ bool Platform::GetFirmwarePin(int logicalPin, PinAccess access, Pin& firmwarePin
 		   )
 		{
 			firmwarePin = COOLING_FAN_PINS[logicalPin - Fan0LogicalPin];
-#if !defined(DUET_NG) && !defined(__RADDS__) && !defined(__ALLIGATOR__)
+#if defined(DUET_06_085)
 			invert = (board == BoardType::Duet_06 || board == BoardType::Duet_07);
 #endif
 		}
@@ -3357,7 +3424,7 @@ bool Platform::GetFirmwarePin(int logicalPin, PinAccess access, Pin& firmwarePin
 		}
 		if (logicalPinModes[logicalPin] != (int8_t)desiredMode)
 		{
-			SetPinMode(firmwarePin, desiredMode);
+			IoPort::SetPinMode(firmwarePin, desiredMode);
 			logicalPinModes[logicalPin] = (int8_t)desiredMode;
 		}
 		return true;
@@ -3365,35 +3432,63 @@ bool Platform::GetFirmwarePin(int logicalPin, PinAccess access, Pin& firmwarePin
 	return false;
 }
 
-bool Platform::SetExtrusionAncilliaryPwmPin(int logicalPin)
+bool Platform::SetExtrusionAncilliaryPwmPin(LogicalPin logicalPin)
 {
-	return GetFirmwarePin(logicalPin, PinAccess::pwm, extrusionAncilliaryPwmFirmwarePin, extrusionAncilliaryPwmInvert);
+	return extrusionAncilliaryPwmPort.Set(logicalPin, PinAccess::pwm);
 }
 
-// Filament sensor support
-// Get the filament sensor object for an extruder, or nullptr if there isn't one
-FilamentSensor *Platform::GetFilamentSensor(int extruder) const
+// CNC and laser support
+void Platform::SetSpindlePwm(float pwm)
 {
-	return (extruder >= 0 && extruder < (int)MaxExtruders) ? filamentSensors[extruder] : nullptr;
-}
-
-// Set the filament sensor type for an extruder, returning true if it has changed.
-// Passing newSensorType as 0 sets no sensor.
-bool Platform::SetFilamentSensorType(int extruder, int newSensorType)
-{
-	if (extruder >= 0 && extruder < (int)MaxExtruders)
+	if (pwm >= 0)
 	{
-		FilamentSensor*& sensor = filamentSensors[extruder];
-		const int oldSensorType = (sensor == nullptr) ? 0 : sensor->GetType();
-		if (newSensorType != oldSensorType)
-		{
-			delete sensor;
-			sensor = FilamentSensor::Create(newSensorType);
-			return true;
-		}
+		spindleReversePort.WriteAnalog(0.0);
+		spindleForwardPort.WriteAnalog(pwm);
 	}
+	else
+	{
+		spindleForwardPort.WriteAnalog(0.0);
+		spindleReversePort.WriteAnalog(-pwm);
+	}
+}
 
-	return false;
+void Platform::SetLaserPwm(float pwm)
+{
+	laserPort.WriteAnalog(pwm);
+}
+
+bool Platform::SetSpindlePins(LogicalPin lpf, LogicalPin lpr)
+{
+	const bool ok1 = spindleForwardPort.Set(lpf, PinAccess::pwm);
+	if (lpr == NoLogicalPin)
+	{
+		spindleReversePort.Clear();
+		return ok1;
+	}
+	const bool ok2 = spindleReversePort.Set(lpr, PinAccess::pwm);
+	return ok1 && ok2;
+}
+
+void Platform::GetSpindlePins(LogicalPin& lpf, LogicalPin& lpr) const
+{
+	lpf = spindleForwardPort.GetLogicalPin();
+	lpr = spindleReversePort.GetLogicalPin();
+}
+
+void Platform::SetSpindlePwmFrequency(float freq)
+{
+	spindleForwardPort.SetFrequency(freq);
+	spindleReversePort.SetFrequency(freq);
+}
+
+bool Platform::SetLaserPin(LogicalPin lp)
+{
+	return laserPort.Set(lp, PinAccess::pwm);
+}
+
+void Platform::SetLaserPwmFrequency(float freq)
+{
+	laserPort.SetFrequency(freq);
 }
 
 // Get the firmware pin number for an endstop, or NoPin if it is out of range
@@ -3401,7 +3496,6 @@ Pin Platform::GetEndstopPin(int endstop) const
 {
 	return (endstop >= 0 && endstop < (int)ARRAY_SIZE(endStopPins)) ? endStopPins[endstop] : NoPin;
 }
-
 
 #if SUPPORT_INKJET
 
@@ -3448,7 +3542,7 @@ bool Platform::Inkjet(int bitPattern)
 }
 #endif
 
-#ifndef __RADDS__
+#if HAS_CPU_TEMP_SENSOR
 // CPU temperature
 void Platform::GetMcuTemperatures(float& minT, float& currT, float& maxT) const
 {
@@ -3497,59 +3591,8 @@ bool Platform::SetDateTime(time_t time)
 	const bool ok = (gmtime_r(&time, &brokenDateTime) != nullptr);
 	if (ok)
 	{
+		Message(LogMessage, "Time and date set\n");
 		realTime = time;
-		timeLastUpdatedMillis = millis();
-	}
-	return ok;
-}
-
-bool Platform::SetDate(time_t date)
-{
-	// Check the validity of the date passed in
-	struct tm brokenNewDate;
-	const bool ok = (gmtime_r(&date, &brokenNewDate) != nullptr);
-	if (ok)
-	{
-		struct tm brokenTimeNow;
-		if (realTime == 0 || gmtime_r(&realTime, &brokenTimeNow) == nullptr)
-		{
-			// We didn't have a valid date/time set, so set the date and time to the value passed in
-			realTime = date;
-			timeLastUpdatedMillis = millis();
-		}
-		else
-		{
-			// Merge the existing time into the date passed in
-			brokenNewDate.tm_hour = brokenTimeNow.tm_hour;
-			brokenNewDate.tm_min = brokenTimeNow.tm_min;
-			brokenNewDate.tm_sec = brokenTimeNow.tm_sec;
-			realTime = mktime(&brokenNewDate);
-		}
-	}
-	return ok;
-}
-
-bool Platform::SetTime(time_t time)
-{
-	// Check the validity of the date passed in
-	struct tm brokenNewTime;
-	const bool ok = (gmtime_r(&time, &brokenNewTime) != nullptr);
-	if (ok)
-	{
-		struct tm brokenTimeNow;
-		if (realTime == 0 || gmtime_r(&realTime, &brokenTimeNow) == nullptr)
-		{
-			// We didn't have a valid date/time set, so set the date and time to the value passed in
-			realTime = time;
-		}
-		else
-		{
-			// Merge the new time into the current date/time
-			brokenTimeNow.tm_hour = brokenNewTime.tm_hour;
-			brokenTimeNow.tm_min = brokenNewTime.tm_min;
-			brokenTimeNow.tm_sec = brokenNewTime.tm_sec;
-			realTime = mktime(&brokenTimeNow);
-		}
 		timeLastUpdatedMillis = millis();
 	}
 	return ok;
@@ -3720,10 +3763,9 @@ void Platform::Tick()
 		}
 
 		// Read the MCU temperature as well (no need to do it in every state)
-#ifndef __RADDS__
+#if HAS_CPU_TEMP_SENSOR
 		const_cast<ThermistorAveragingFilter&>(cpuTemperatureFilter).ProcessReading(AnalogInReadChannel(temperatureAdcChannel));
 #endif
-
 		++tickState;
 		break;
 

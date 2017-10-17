@@ -11,6 +11,7 @@
 #include "FtpResponder.h"
 #include "TelnetResponder.h"
 #include "WifiFirmwareUploader.h"
+#include "Libraries/General/IP4String.h"
 
 // Define exactly one of the following as 1, the other as zero
 // The PDC seems to be too slow to work reliably without getting transmit underruns, so we use the DMAC now.
@@ -28,6 +29,7 @@
 #include "matrix.h"
 
 const uint32_t WifiResponseTimeoutMillis = 200;
+const uint32_t WiFiWaitReadyMillis = 100;
 const uint32_t WiFiStartupMillis = 300;
 const uint32_t WiFiStableMillis = 100;
 
@@ -118,7 +120,7 @@ Network::Network(Platform& p) : platform(p), nextResponderToPoll(nullptr), uploa
 		responders = new HttpResponder(responders);
 	}
 
-	strcpy(ssid, "(unknown)");
+	strcpy(actualSsid, "(unknown)");
 	strcpy(wiFiServerVersion, "(unknown)");
 }
 
@@ -126,8 +128,7 @@ void Network::Init()
 {
 	// Make sure the ESP8266 is held in the reset state
 	ResetWiFi();
-	longWait = platform.Time();
-	lastTickMillis = millis();
+	longWait = lastTickMillis = millis();
 
 	NetworkBuffer::AllocateBuffers(NetworkBufferCount);
 
@@ -285,7 +286,7 @@ void Network::Activate()
 		}
 		else
 		{
-			platform.Message(HOST_MESSAGE, "Network disabled.\n");
+			platform.Message(UsbMessage, "Network disabled.\n");
 		}
 	}
 }
@@ -315,7 +316,7 @@ bool Network::GetNetworkState(StringRef& reply)
 		reply.cat(TranslateWiFiState(currentMode));
 		if (currentMode == WiFiState::connected || currentMode == WiFiState::runningAsAccessPoint)
 		{
-			reply.catf("%s, IP address %u.%u.%u.%u", ssid, ipAddress[0], ipAddress[1], ipAddress[2], ipAddress[3]);
+			reply.catf("%s, IP address %s", actualSsid, IP4String(ipAddress).c_str());
 		}
 		break;
 	default:
@@ -374,6 +375,7 @@ void Network::Start()
 
 	// The ESP takes about 300ms before it starts talking to us, so don't wait for it here, do that in Spin()
 	spiTxUnderruns = spiRxOverruns = 0;
+	reconnectCount = 0;
 
 	lastTickMillis = millis();
 	state = NetworkState::starting1;
@@ -426,7 +428,7 @@ void Network::Spin(bool full)
 				if (now - lastTickMillis >= WiFiStableMillis)
 				{
 					// Setup the SPI controller in slave mode and assign the CS pin to it
-					platform.Message(NETWORK_INFO_MESSAGE, "WiFi module started\n");
+					platform.Message(NetworkInfoMessage, "WiFi module started\n");
 					SetupSpi();									// set up the SPI subsystem
 
 					// Read the status to get the WiFi server version
@@ -439,7 +441,7 @@ void Network::Spin(bool full)
 						// Set the hostname before anything else is done
 						if (SendCommand(NetworkCommand::networkSetHostName, 0, 0, hostname, HostNameLength, nullptr, 0) != ResponseEmpty)
 						{
-							reprap.GetPlatform().Message(NETWORK_INFO_MESSAGE, "Error: Could not set WiFi hostname\n");
+							reprap.GetPlatform().Message(NetworkInfoMessage, "Error: Could not set WiFi hostname\n");
 						}
 
 						state = NetworkState::active;
@@ -449,7 +451,7 @@ void Network::Spin(bool full)
 					{
 						// Something went wrong, maybe a bad firmware image was flashed
 						// Disable the WiFi chip again in this case
-						platform.MessageF(NETWORK_INFO_MESSAGE, "Error: Failed to initialise WiFi module, code %d\n", rc);
+						platform.MessageF(NetworkInfoMessage, "Error: Failed to initialise WiFi module, code %" PRIi32 "\n", rc);
 						Stop();
 					}
 				}
@@ -479,7 +481,11 @@ void Network::Spin(bool full)
 				}
 				GetNewStatus();
 			}
-			else if (currentMode != requestedMode && currentMode != WiFiState::connecting)
+			else if (   currentMode != requestedMode
+					 && currentMode != WiFiState::connecting
+					 && currentMode != WiFiState::reconnecting
+					 && currentMode != WiFiState::autoReconnecting
+					)
 			{
 				// Tell the wifi module to change mode
 				int32_t rslt = ResponseUnknownError;
@@ -490,7 +496,7 @@ void Network::Spin(bool full)
 				}
 				else if (requestedMode == WiFiState::connected)
 				{
-					rslt = SendCommand(NetworkCommand::networkStartClient, 0, 0, nullptr, 0, nullptr, 0);
+					rslt = SendCommand(NetworkCommand::networkStartClient, 0, 0, requestedSsid, SsidLength, nullptr, 0);
 				}
 				else if (requestedMode == WiFiState::runningAsAccessPoint)
 				{
@@ -504,7 +510,7 @@ void Network::Spin(bool full)
 				else
 				{
 					Stop();
-					platform.MessageF(NETWORK_INFO_MESSAGE, "Failed to change WiFi mode (code %d)\n", rslt);
+					platform.MessageF(NetworkInfoMessage, "Failed to change WiFi mode (code %" PRIi32 ")\n", rslt);
 				}
 			}
 			else if (currentMode == WiFiState::connected || currentMode == WiFiState::runningAsAccessPoint)
@@ -581,17 +587,18 @@ void Network::Spin(bool full)
 							ipAddress[i] = (uint8_t)(ip & 255);
 							ip >>= 8;
 						}
-						SafeStrncpy(ssid, status.Value().ssid, SsidLength);
+						SafeStrncpy(actualSsid, status.Value().ssid, SsidLength);
 					}
 					InitSockets();
-					platform.MessageF(NETWORK_INFO_MESSAGE, "Wifi module is %s%s, IP address %u.%u.%u.%u\n",
+					reconnectCount = 0;
+					platform.MessageF(NetworkInfoMessage, "Wifi module is %s%s, IP address %s\n",
 						TranslateWiFiState(currentMode),
-						ssid,
-						ipAddress[0], ipAddress[1], ipAddress[2], ipAddress[3]);
+						actualSsid,
+						IP4String(ipAddress).c_str());
 				}
 				else
 				{
-					platform.MessageF(NETWORK_INFO_MESSAGE, "Wifi module is %s\n", TranslateWiFiState(currentMode));
+					platform.MessageF(NetworkInfoMessage, "Wifi module is %s\n", TranslateWiFiState(currentMode));
 				}
 			}
 		}
@@ -658,18 +665,17 @@ void Network::Diagnostics(MessageType mtype)
 			platform.MessageF(mtype, "WiFi firmware version %s\n", r.versionText);
 			platform.MessageF(mtype, "WiFi MAC address %02x:%02x:%02x:%02x:%02x:%02x\n",
 								r.macAddress[0], r.macAddress[1], r.macAddress[2], r.macAddress[3], r.macAddress[4], r.macAddress[5]);
-			platform.MessageF(mtype, "WiFi Vcc %.2f, reset reason %s\n", (float)r.vcc/1024, TranslateEspResetReason(r.resetReason));
-			platform.MessageF(mtype, "WiFi flash size %u, free heap %u\n", r.flashSize, r.freeHeap);
+			platform.MessageF(mtype, "WiFi Vcc %.2f, reset reason %s\n", (double)((float)r.vcc/1024), TranslateEspResetReason(r.resetReason));
+			platform.MessageF(mtype, "WiFi flash size %" PRIu32 ", free heap %" PRIu32 "\n", r.flashSize, r.freeHeap);
 
 			if (currentMode == WiFiState::connected || currentMode == WiFiState::runningAsAccessPoint)
 			{
-				platform.MessageF(mtype, "WiFi IP address %d.%d.%d.%d\n",
-					r.ipAddress & 255, (r.ipAddress >> 8) & 255, (r.ipAddress >> 16) & 255, (r.ipAddress >> 24) & 255);
+				platform.MessageF(mtype, "WiFi IP address %s\n", IP4String(r.ipAddress).c_str());
 			}
 
 			if (currentMode == WiFiState::connected)
 			{
-				platform.MessageF(mtype, "WiFi signal strength %ddBm\n", (int)r.rssi);
+				platform.MessageF(mtype, "WiFi signal strength %ddBm\nReconnections %u\n", (int)r.rssi, reconnectCount);
 			}
 			else if (currentMode == WiFiState::runningAsAccessPoint)
 			{
@@ -702,13 +708,20 @@ void Network::Diagnostics(MessageType mtype)
 	platform.Message(mtype, "\n");
 }
 
-void Network::Enable(int mode, StringRef& reply)
+// Enable or disable the network
+void Network::Enable(int mode, const StringRef& ssid, StringRef& reply)
 {
 	// Translate enable mode to desired WiFi mode
 	const WiFiState modeRequested = (mode == 0) ? WiFiState::idle
 									: (mode == 1) ? WiFiState::connected
 										: (mode == 2) ? WiFiState::runningAsAccessPoint
 											: WiFiState::disabled;
+	if (modeRequested == WiFiState::connected)
+	{
+		memset(requestedSsid, 0, sizeof(requestedSsid));
+		SafeStrncpy(requestedSsid, ssid.Pointer(), ARRAY_SIZE(requestedSsid));
+	}
+
 	if (activated)
 	{
 		if (modeRequested == WiFiState::disabled)
@@ -718,7 +731,7 @@ void Network::Enable(int mode, StringRef& reply)
 			if (state != NetworkState::disabled)
 			{
 				Stop();
-				platform.Message(GENERIC_MESSAGE, "WiFi module stopped\n");
+				platform.Message(GenericMessage, "WiFi module stopped\n");
 			}
 		}
 		else
@@ -768,6 +781,8 @@ int Network::EnableState() const
 	case WiFiState::connecting:				return "trying to connect";
 	case WiFiState::connected:				return "connected to access point ";
 	case WiFiState::runningAsAccessPoint:	return "providing access point ";
+	case WiFiState::autoReconnecting:		return "auto-reconnecting";
+	case WiFiState::reconnecting:			return "reconnecting";
 	default:								return "in an unknown state";
 	}
 }
@@ -818,7 +833,7 @@ void Network::SetHostname(const char *name)
 	{
 		if (SendCommand(NetworkCommand::networkSetHostName, 0, 0, hostname, HostNameLength, nullptr, 0) != ResponseEmpty)
 		{
-			platform.Message(GENERIC_MESSAGE, "Error: Could not set WiFi hostname\n");
+			platform.Message(GenericMessage, "Error: Could not set WiFi hostname\n");
 		}
 	}
 }
@@ -1171,13 +1186,29 @@ int32_t Network::SendCommand(NetworkCommand cmd, SocketNumber socketNum, uint8_t
 		return ResponseNetworkDisabled;
 	}
 
-	if (!digitalRead(EspTransferRequestPin) || transferPending || !spi_dma_check_rx_complete())
+	if (transferPending)
 	{
 		if (reprap.Debug(moduleNetwork))
 		{
 			debugPrintf("ResponseBusy\n");
 		}
 		return ResponseBusy;
+	}
+
+	// Wait for the ESP to be ready, with timeout
+	{
+		const uint32_t now = millis();
+		while (!digitalRead(EspTransferRequestPin))
+		{
+			if (millis() - now > WiFiWaitReadyMillis)
+			{
+				if (reprap.Debug(moduleNetwork))
+				{
+					debugPrintf("ResponseBusy\n");
+				}
+				return ResponseBusy;
+			}
+		}
 	}
 
 	bufferOut.hdr.formatVersion = MyFormatVersion;
@@ -1212,16 +1243,20 @@ int32_t Network::SendCommand(NetworkCommand cmd, SocketNumber socketNum, uint8_t
 	digitalWrite(SamTfrReadyPin, HIGH);
 
 	// Wait for the DMA complete interrupt, with timeout
-	const uint32_t now = millis();
-	while (transferPending || !spi_dma_check_rx_complete())
 	{
-		if (millis() - now > WifiResponseTimeoutMillis)
+		const uint32_t now = millis();
+		while (transferPending || !spi_dma_check_rx_complete())
 		{
-			if (reprap.Debug(moduleNetwork))
+			if (millis() - now > WifiResponseTimeoutMillis)
 			{
-				debugPrintf("ResponseTimeout, pending=%d\n", (int)transferPending);
+				if (reprap.Debug(moduleNetwork))
+				{
+					debugPrintf("ResponseTimeout, pending=%d\n", (int)transferPending);
+				}
+				transferPending = false;
+				spi_dma_disable();
+				return ResponseTimeout;
 			}
-			return ResponseTimeout;
 		}
 	}
 
@@ -1233,6 +1268,12 @@ int32_t Network::SendCommand(NetworkCommand cmd, SocketNumber socketNum, uint8_t
 	}
 	else
 	{
+		if (   (bufferIn.hdr.state == WiFiState::autoReconnecting || bufferIn.hdr.state == WiFiState::reconnecting)
+			&& currentMode != WiFiState::autoReconnecting && currentMode != WiFiState::reconnecting
+		   )
+		{
+			++reconnectCount;
+		}
 		currentMode = bufferIn.hdr.state;
 		response = bufferIn.hdr.response;
 		if (response > 0 && dataIn != nullptr)
@@ -1243,7 +1284,7 @@ int32_t Network::SendCommand(NetworkCommand cmd, SocketNumber socketNum, uint8_t
 
 	if (response < 0 && reprap.Debug(moduleNetwork))
 	{
-		debugPrintf("Network command %d socket %u returned error %d\n", (int)cmd, socketNum, response);
+		debugPrintf("Network command %d socket %u returned error %" PRIi32 "\n", (int)cmd, socketNum, response);
 	}
 
 #if 0
@@ -1283,11 +1324,11 @@ void Network::GetNewStatus()
 	rcvr.Value().messageBuffer[ARRAY_UPB(rcvr.Value().messageBuffer)] = 0;
 	if (rslt < 0)
 	{
-		platform.Message(NETWORK_INFO_MESSAGE, "Error retrieving WiFi status message\n");
+		platform.Message(NetworkInfoMessage, "Error retrieving WiFi status message\n");
 	}
 	else if (rslt > 0 && rcvr.Value().messageBuffer[0] != 0)
 	{
-		platform.MessageF(NETWORK_INFO_MESSAGE, "WiFi reported error: %s\n", rcvr.Value().messageBuffer);
+		platform.MessageF(NetworkInfoMessage, "WiFi reported error: %s\n", rcvr.Value().messageBuffer);
 	}
 }
 

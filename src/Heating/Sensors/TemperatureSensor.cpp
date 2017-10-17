@@ -6,11 +6,12 @@
 #include "RtdSensor31865.h"
 #include "GCodes/GCodeBuffer.h"
 
-#ifndef __RADDS__
+#if HAS_CPU_TEMP_SENSOR
 #include "CpuTemperatureSensor.h"
 #endif
 
 #ifdef DUET_NG
+#include "DhtSensor.h"
 #include "TmcDriverTemperatureSensor.h"
 #endif
 
@@ -23,7 +24,7 @@ TemperatureSensor::~TemperatureSensor()
 	delete heaterName;
 }
 
-// Set the name - normally called only once
+// Set the name - normally called only once, so we allow heap memory to be allocated
 void TemperatureSensor::SetHeaterName(const char *newName)
 {
 	// Change the heater name in a thread-safe manner
@@ -33,7 +34,7 @@ void TemperatureSensor::SetHeaterName(const char *newName)
 
 	if (newName != nullptr)
 	{
-		char *temp = new char[strlen(newName)];
+		char * const temp = new char[strlen(newName) + 1];
 		strcpy(temp, newName);
 		heaterName = temp;
 	}
@@ -68,12 +69,12 @@ void TemperatureSensor::CopyBasicHeaterDetails(unsigned int heater, StringRef& r
 // Configure then heater name, if it is provided
 void TemperatureSensor::TryConfigureHeaterName(GCodeBuffer& gb, bool& seen)
 {
-	char buf[MaxHeaterNameLength + 1];
+	String<MaxHeaterNameLength> buf;
 	bool localSeen = false;
-	gb.TryGetQuotedString('S', buf, ARRAY_SIZE(buf), localSeen);
+	gb.TryGetQuotedString('S', buf.GetRef(), localSeen);
 	if (localSeen)
 	{
-		SetHeaterName(buf);
+		SetHeaterName(buf.c_str());
 		seen = true;
 	}
 }
@@ -84,34 +85,40 @@ TemperatureSensor *TemperatureSensor::Create(unsigned int channel)
 	TemperatureSensor *ts = nullptr;
 	if (channel < Heaters)
 	{
-		ts =  new Thermistor(channel);
+		ts = new Thermistor(channel);
 	}
 	else if (FirstMax31855ThermocoupleChannel <= channel && channel < FirstMax31855ThermocoupleChannel + MaxSpiTempSensors)
 	{
-		ts =  new ThermocoupleSensor31855(channel);
+		ts = new ThermocoupleSensor31855(channel);
 	}
 	else if (FirstMax31856ThermocoupleChannel <= channel && channel < FirstMax31856ThermocoupleChannel + MaxSpiTempSensors)
 	{
-		ts =  new ThermocoupleSensor31856(channel);
+		ts = new ThermocoupleSensor31856(channel);
 	}
 	else if (FirstRtdChannel <= channel && channel < FirstRtdChannel + MaxSpiTempSensors)
 	{
-		ts =  new RtdSensor31865(channel);
+		ts = new RtdSensor31865(channel);
 	}
 	else if (FirstLinearAdcChannel <= channel && channel < FirstLinearAdcChannel + MaxSpiTempSensors)
 	{
-		ts =  new CurrentLoopTemperatureSensor(channel);
+		ts = new CurrentLoopTemperatureSensor(channel);
 	}
-#ifndef __RADDS__
+#ifdef DUET_NG
+	else if (channel == DhtTemperatureChannel || channel == DhtHumidityChannel)
+	{
+		ts = new DhtSensor(channel);
+	}
+#endif
+#if HAS_CPU_TEMP_SENSOR
 	else if (channel == CpuTemperatureSenseChannel)
 	{
-		ts =  new CpuTemperatureSensor(channel);
+		ts = new CpuTemperatureSensor(channel);
 	}
 #endif
 #ifdef DUET_NG
 	else if (channel >= FirstTmcDriversSenseChannel && channel < FirstTmcDriversSenseChannel + 2)
 	{
-		ts =  new TmcDriverTemperatureSensor(channel);
+		ts = new TmcDriverTemperatureSensor(channel);
 	}
 #endif
 

@@ -40,11 +40,13 @@ bool Thermistor::Configure(unsigned int mCode, unsigned int heater, GCodeBuffer&
 	bool seen = false;
 	if (mCode == 305)
 	{
-		// We must set the 25C resistance and beta together in order to calculate Rinf. Check for these first.
-
-		gb.TryGetFValue('T', r25, seen);
 		gb.TryGetFValue('B', beta, seen);
+		if (seen)
+		{
+			shC = 0.0;						// if user changes B and doesn't define C, assume C=0
+		}
 		gb.TryGetFValue('C', shC, seen);
+		gb.TryGetFValue('T', r25, seen);
 		gb.TryGetFValue('R', seriesR, seen);
 		if (seen)
 		{
@@ -68,7 +70,7 @@ bool Thermistor::Configure(unsigned int mCode, unsigned int heater, GCodeBuffer&
 		{
 			CopyBasicHeaterDetails(heater, reply);
 			reply.catf(", T:%.1f B:%.1f C:%.2e R:%.1f L:%d H:%d",
-					r25, beta, shC, seriesR, adcLowOffset, adcHighOffset);
+				(double)r25, (double)beta, (double)shC, (double)seriesR, adcLowOffset, adcHighOffset);
 		}
 	}
 
@@ -132,7 +134,7 @@ int32_t Thermistor::CalcAdcReading(float temperature) const
 void Thermistor::CalcDerivedParameters()
 {
 	shB = 1.0/beta;
-	const double lnR25 = log(r25);
+	const float lnR25 = logf(r25);
 	shA = 1.0/(25.0 - ABS_ZERO) - shB * lnR25 - shC * lnR25 * lnR25 * lnR25;
 }
 

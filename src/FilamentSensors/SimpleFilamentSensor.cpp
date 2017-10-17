@@ -23,7 +23,7 @@ bool SimpleFilamentSensor::Configure(GCodeBuffer& gb, StringRef& reply, bool& se
 
 	if (seen)
 	{
-		Check(0.0);
+		Check(true, 0.0);
 	}
 	else
 	{
@@ -43,20 +43,20 @@ void SimpleFilamentSensor::Interrupt()
 // Call the following regularly to keep the status up to date
 void SimpleFilamentSensor::Poll()
 {
-	const bool b = Platform::ReadPin(GetPin());
+	const bool b = IoPort::ReadPin(GetPin());
 	filamentPresent = (highWhenNoFilament) ? !b : b;
 }
 
 // Call the following at intervals to check the status. This is only called when extrusion is in progress or imminent.
 // 'filamentConsumed' is the net amount of extrusion since the last call to this function.
-FilamentSensorStatus SimpleFilamentSensor::Check(float filamentConsumed)
+FilamentSensorStatus SimpleFilamentSensor::Check(bool full, float filamentConsumed)
 {
 	Poll();
 	return (filamentPresent) ? FilamentSensorStatus::ok : FilamentSensorStatus::noFilament;
 }
 
 // Clear the measurement state - called when we are not printing a file. Return the present/not present status if available.
-FilamentSensorStatus SimpleFilamentSensor::Clear()
+FilamentSensorStatus SimpleFilamentSensor::Clear(bool full)
 {
 	Poll();
 	return (filamentPresent) ? FilamentSensorStatus::ok : FilamentSensorStatus::noFilament;

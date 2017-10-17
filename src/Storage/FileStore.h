@@ -10,6 +10,13 @@
 class Platform;
 class FileWriteBuffer;
 
+enum class OpenMode : uint8_t
+{
+	read,			// open an existing file for reading
+	write,			// write a file, replacing any existing file of the same name
+	append			// append to an existing file, or create a new file if it is not found
+};
+
 class FileStore
 {
 public:
@@ -27,7 +34,6 @@ public:
 	bool GoToEnd();									// Position the file at the end (so you can write on the end).
 #endif
 	FilePosition Length() const;					// File size in bytes
-	float FractionRead() const;						// How far in we are
 	void Duplicate();								// Create a second reference to this file
 	bool Flush();									// Write remaining buffer data
 	void Invalidate(const FATFS *fs);				// Invalidate the file if it uses the specified FATFS object
@@ -45,7 +51,7 @@ protected:
 
 	FileStore(Platform* p);
 	void Init();
-    bool Open(const char* directory, const char* fileName, bool write);
+    bool Open(const char* directory, const char* fileName, OpenMode mode);
     FRESULT Store(const char *s, size_t len, size_t *bytesWritten); // Write data to the non-volatile storage
 
 private:
