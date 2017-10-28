@@ -1,6 +1,67 @@
 Summary of important changes in recent versions
 ===============================================
 
+Version 1.20beta4
+=================
+
+Bug fixes:
+
+- Resuming a print after pausing still sometimes gave a "low voltage" error if no M911 command had been used
+- Simulation mode didn't work in 1.20b2 or 1.20b3
+
+Version 1.20beta3
+=================
+
+Bug fixes:
+- M500 command wrote extra M307 lines were written to config-override.g in 1.20b2
+- CoreXY homing didn't work in 1.20b2
+- Motor idle detection didn't work in 1.20b2
+- M585 didn't work
+- Resuming a print after pausing gave a "low voltage" error if no M911 command had been used
+- The code to detect M122 early also recognised commands of the form Mxxx122 where xxx were non-numeric
+
+Version 1.20beta2
+=================
+
+Upgrade notes
+- Duet WiFi users can use either DuetWiFiServer 1.20beta2 (which disables WiFi module sleep) or 1.20alpha1 (which uses the default "modem sleep" mode)
+- The parameters to the M911 command (which configures power fail handling) have changed. If you use this command in config.g you will have to change it accordingly.
+- On a Duet WiFi, if your M552 command in config.g includes a P parameter with an IP address, you will need to remove them
+- If you currently have G31 parameters for your active Z probe in config-override.g that are different from the ones in config.g, you should copy them to config.g, otherwise they will be lost next time you run M500.
+
+New and changed features:
+- M500 no longer saves G31 Z probe parameters to confog-override.g
+- A line of GCode may now contain multiple G- and M-commands. The commands are executed sequentially. A command that takes an un-quoted string parameter must be the last command on the line. A T command must be on a line by itself.
+- On SCARA printers, arm position limits are applied as well as XY size limits
+- Heater 0 values are sent to to PanelDue even if there is no heated bed
+- When logging is enabled, a log entry is now written when the date/time is set
+- When logging is enabled, "Maximum open file count exceeded" messages are logged
+- Loss of power is now handled much faster. The print is paused in the middle of a move if necessary. The M911 parameters are changed to facilitate this.
+- Following a power failure, M916 can now be used to resume the print instead of using M98 Presurrect.g
+- The TMC2660 Stallguard detection and Coolstep parameters may now be configured using M915. Currently, no action is performed when a stall is signalled.
+- If a heater fault occurs, the print is paused instead of cancelled
+- The start and end speeds of short segmented moves in accelerating or decalerating sequences are more closely matched where possible, which should give smoother motion
+- All error messages relating to incorrect use of a G- or M-code now include the G- or M-number of the command that caused them
+- Increased ADC oversample bits to 2
+- Duet WiFi: M122 diagnostics now include the wifi module sleep mode and additional network diagnostics
+- You can now disable monitoring of TMC2660 drivers that are not in use by using parameter R-1 in the corresponding M569 command
+- The M585 (probe tool) command is now implemented (thanks chrishamm)
+- If axis lengths are adjusted by probing, a subsequent M500 command saves them in config-override.g
+- If tool offsets are adjusted by probing, a subsequent M500 command saves them in config-override.g 
+- The layer counting mechanism has been modified to better handle GCode files that use a different layer height when printing support
+- Debug messages sent to the USB port are truncated or thrown away if a software watchdog reset is imminent
+- XY speed limiting is now done separately for each kinematics, in particular for CoreXY printers it is more accurate
+- Support for Polar kinematics has been added but not tested, see M669 command
+- The TMC2660 drivers are configured to detect short-to-ground conditions faster
+- The parameters in rr_ http commands are now all order-independent
+
+Bug fixes:
+- An error in computing the time taken to execute moves that were not yet frozen caused the first movement on a SCARA printer following homing to be jerky
+- An extra space in the output from the M114 command confused Pronterface, causing it to print exception messages
+- An error in the motion planning system that could lead to a null pointer dereference has been fixed. It is not known what symptoms (if any) were associated with this bug.
+- When tuning a heater, any previous maximum PWM value that was set is now ignored
+
+
 Version 1.20beta1
 =================
 

@@ -100,6 +100,7 @@ Tool * Tool::freelist = nullptr;
 	t->yMapping = yMap;
 	t->fanMapping = fanMap;
 	t->heaterFault = false;
+	t->axisOffsetsProbed = 0;
 	t->displayColdExtrudeWarning = false;
 
 	for (size_t axis = 0; axis < MaxAxes; axis++)
@@ -461,11 +462,12 @@ bool Tool::WriteSettings(FileStore *f) const
 	return ok;
 }
 
-void Tool::SetOffsets(const float offs[MaxAxes])
+void Tool::SetOffset(size_t axis, float offs, bool byProbing)
 {
-	for(size_t i = 0; i < MaxAxes; ++i)
+	offset[axis] = offs;
+	if (byProbing)
 	{
-		offset[i] = offs[i];
+		SetBit(axisOffsetsProbed, axis);
 	}
 }
 

@@ -23,6 +23,10 @@ Licence: GPL
 #include "RepRap.h"
 #include "Sensors/TemperatureSensor.h"
 
+#if SUPPORT_DHT_SENSOR
+# include "Sensors/DhtSensor.h"
+#endif
+
 Heat::Heat(Platform& p)
 	: platform(p), active(false), coldExtrude(false), bedHeater(DefaultBedHeater), chamberHeater(DefaultChamberHeater), heaterBeingTuned(-1), lastHeaterTuned(-1)
 {
@@ -105,7 +109,7 @@ void Heat::Init()
 	virtualHeaterSensors[0] = TemperatureSensor::Create(CpuTemperatureSenseChannel);
 	virtualHeaterSensors[0]->SetHeaterName("MCU");				// name this virtual heater so that it appears in DWC
 #endif
-#ifdef DUET_NG
+#if HAS_SMART_DRIVERS
 	virtualHeaterSensors[1] = TemperatureSensor::Create(FirstTmcDriversSenseChannel);
 	virtualHeaterSensors[2] = TemperatureSensor::Create(FirstTmcDriversSenseChannel + 1);
 #endif
@@ -146,6 +150,11 @@ void Heat::Spin()
 				heaterBeingTuned = -1;
 			}
 		}
+
+#if SUPPORT_DHT_SENSOR
+		// If the DHT temperature sensor is active, it needs to be spinned too
+		DhtSensor::Spin();
+#endif
 	}
 	platform.ClassReport(longWait);
 }
@@ -488,7 +497,7 @@ float Heat::GetTemperature(size_t heater, TemperatureError& err)
 	return t;
 }
 
-#ifdef DUET_NG
+#if HAS_VOLTAGE_MONITOR
 
 // Suspend the heaters to conserve power
 void Heat::SuspendHeaters(bool sus)
