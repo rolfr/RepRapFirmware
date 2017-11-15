@@ -166,6 +166,7 @@ public:
 	bool IsPausing() const;
 	bool IsResuming() const;
 	bool IsRunning() const;
+	bool IsReallyPrinting() const;										// Return true if we are printing from SD card and not pausing, paused or resuming
 	bool IsDoingToolChange() const { return doingToolChange; }
 
 	bool AllAxesAreHomed() const;										// Return true if all axes are homed
@@ -179,7 +180,7 @@ public:
 	size_t GetNumExtruders() const { return numExtruders; }
 
 	void FilamentError(size_t extruder, FilamentSensorStatus fstat);
-	void HandleHeaterFault(int heater);											// Respond to a heater fault
+	void HandleHeaterFault(int heater);									// Respond to a heater fault
 
 #if HAS_VOLTAGE_MONITOR
 	bool LowVoltagePause();
@@ -187,7 +188,7 @@ public:
 	bool AutoResumeAfterShutdown();
 #endif
 
-	static const char axisLetters[MaxAxes];
+	const char *GetAxisLetters() const { return axisLetters; }			// Return a null-terminated string of axis letters indexed by drive
 
 private:
 	GCodes(const GCodes&);												// private copy constructor to prevent copying
@@ -245,7 +246,6 @@ private:
 	bool Push(GCodeBuffer& gb);											// Push feedrate etc on the stack
 	void Pop(GCodeBuffer& gb);											// Pop feedrate etc
 	void DisableDrives();												// Turn the motors off
-	void SetMACAddress(GCodeBuffer& gb);								// Deals with an M540
 	void HandleReply(GCodeBuffer& gb, bool error, const char *reply);	// Handle G-Code replies
 	void HandleReply(GCodeBuffer& gb, bool error, OutputBuffer *reply);
 	bool OpenFileToWrite(GCodeBuffer& gb, const char* directory, const char* fileName, const FilePosition size, const bool binaryWrite, const uint32_t fileCRC32);
@@ -383,6 +383,8 @@ private:
 	const char* eofString;						// What's at the end of an HTML file?
 	uint8_t eofStringCounter;					// Check the...
 	uint8_t eofStringLength;					// ... EoF string as we read.
+
+	char axisLetters[MaxAxes + 1];				// The names of the axes, with a null terminator
 	bool limitAxes;								// Don't think outside the box.
 
 	AxesBitmap toBeHomed;						// Bitmap of axes still to be homed

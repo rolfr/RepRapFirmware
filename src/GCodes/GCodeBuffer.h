@@ -35,8 +35,8 @@ public:
 	uint32_t GetUIValue();								// Get an unsigned integer value
 	bool GetIPAddress(uint8_t ip[4]);					// Get an IP address quad after a key letter
 	bool GetIPAddress(uint32_t& ip);					// Get an IP address quad after a key letter
-	const char* GetUnprecedentedString(bool optional = false);	// Get a string with no preceding key letter
-	const char* GetString();							// Get an unquoted string after a key letter
+	bool GetMacAddress(uint8_t mac[6]);					// Get a MAX address sextet after a key letter
+	bool GetUnprecedentedString(const StringRef& str);	// Get a string with no preceding key letter
 	bool GetQuotedString(const StringRef& str);			// Get and copy a quoted string
 	bool GetPossiblyQuotedString(const StringRef& str);	// Get and copy a string which may or may not be quoted
 	const void GetFloatArray(float a[], size_t& length, bool doPad) __attribute__((hot)); // Get a :-separated list of floats after a key letter
@@ -51,6 +51,7 @@ public:
 
 	const char* Buffer() const;
 	bool IsIdle() const;
+	bool IsCompletelyIdle() const;
 	bool IsReady() const;								// Return true if a gcode is ready but hasn't been started yet
 	bool IsExecuting() const;							// Return true if a gcode has been started and is not paused
 	void SetFinished(bool f);							// Set the G Code executed (or not)
@@ -70,7 +71,7 @@ public:
 	void SetState(GCodeState newState);
 	void AdvanceState();
 	const char *GetIdentity() const { return identity; }
-	const bool CanQueueCodes() const { return queueCodes; }
+	bool CanQueueCodes() const;
 	void MessageAcknowledged(bool cancelled);
 	FilePosition GetFilePosition(size_t bytesCached) const;	// Get the file position at the start of the current command
 	bool IsWritingBinary() const;		// returns true if writing binary
@@ -101,6 +102,10 @@ private:
 	void StoreAndAddToChecksum(char c);
 	bool LineFinished();								// Deal with receiving end-of-line and return true if we have a command
 	void DecodeCommand();
+	bool InternalGetQuotedString(const StringRef& str)
+		pre (gcodeBuffer[readPointer] == '"'; str.IsEmpty());
+	bool InternalGetPossiblyQuotedString(const StringRef& str)
+		pre (readPointer >= 0);
 
 	GCodeMachineState *machineState;					// Machine state for this gcode source
 	char gcodeBuffer[GCODE_LENGTH];						// The G Code
@@ -159,6 +164,11 @@ inline const char* GCodeBuffer::Buffer() const
 inline bool GCodeBuffer::IsIdle() const
 {
 	return bufferState != GCodeBufferState::ready && bufferState != GCodeBufferState::executing;
+}
+
+inline bool GCodeBuffer::IsCompletelyIdle() const
+{
+	return GetState() == GCodeState::normal && IsIdle();
 }
 
 inline bool GCodeBuffer::IsReady() const

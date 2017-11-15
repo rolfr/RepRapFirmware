@@ -8,8 +8,15 @@
 #ifndef TMC2660_H_
 #define TMC2660_H_
 
+#include "RepRapFirmware.h"
 #include "Pins.h"
 #include "Libraries/General/StringRef.h"
+
+// The Platform class needs to know which USART we are using when assigning interrupt priorities
+#define USART_TMC_DRV			USART1
+#define USART_TMC_DRV_IRQn		USART1_IRQn
+#define ID_USART_TMC_DRV		ID_USART1
+#define USART_TMC_DRV_Handler	USART1_Handler
 
 // TMC2660 Read response. The microstep counter can also be read, but we don't include that here.
 const uint32_t TMC_RR_SG = 1 << 0;		// stall detected
@@ -24,14 +31,17 @@ namespace SmartDrivers
 {
 	void Init(const Pin[DRIVES], size_t numTmcDrivers)
 		pre(numTmcDrivers <= DRIVES);
+	void SetAxisNumber(size_t drive, uint32_t axisNumber);
 	void SetCurrent(size_t drive, float current);
 	void EnableDrive(size_t drive, bool en);
-	uint32_t GetStatus(size_t drive);
+	uint32_t GetLiveStatus(size_t drive);
+	uint32_t GetAccumulatedStatus(size_t drive, uint32_t bitsToKeep);
 	bool SetMicrostepping(size_t drive, int microsteps, int mode);
 	unsigned int GetMicrostepping(size_t drive, int mode, bool& interpolation);
 	void SetDriversPowered(bool powered);
 	void SetStallThreshold(size_t drive, int sgThreshold);
 	void SetStallFilter(size_t drive, bool sgFilter);
+	void SetStallMinimumStepsPerSecond(size_t drive, unsigned int stepsPerSecond);
 	void SetCoolStep(size_t drive, uint16_t coolStepConfig);
 	void AppendStallConfig(size_t drive, StringRef& reply);
 };

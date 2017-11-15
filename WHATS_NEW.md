@@ -1,6 +1,55 @@
 Summary of important changes in recent versions
 ===============================================
 
+Version 1.20beta7
+=================
+
+Upgrade notes:
+- Recommended DuetWiFiServer.bin version is 1.20beta8
+- Recommended DuetWebControl version is 1.19.3
+- If you have a SCARA printer with nonzero crosstalk parameters (C parameters in the M669 command), you may need to adjust the crosstalk values
+
+New features:
+- String parameters (e.g. filenames) can optionally be enclosed in double quote characters, in all GCode commands for which double quote characters are not compulsory
+- Added deleteexisting=yes option in http move command
+- When a T command is sent and the current tool does not change, the firmware now makes sure that the tool heaters are turned on, in case they had been turned off explicitly e.g. due to upgrading WiFi firmware
+- SCARA kinematics crosstalk parameters now relate the movement units, not the number of motor steps
+- When executing macros, non-movement commands are now synchronised to movement commands even if they are not normally synchronised for that GCode command source
+
+Bug fixes
+- The determination of whether a print is in the process of pausing did not take account of all possible gcode sources
+- M0 and M1 commands no longer turn off heaters and drives when in simulation mode
+- SCARA printer homing didn't take account of the crosstalk parameters
+- M589 with an S parameter now flags an error if there is no I (IP address) parameter
+- When resuming a print, the initial feed rate wasn't being passed to the SD card GCode source
+- The FTP responder now supports the "CWD ." command
+
+Version 1.20beta6
+=================
+
+Upgrade notes:
+- If you are using a Duet to control a RepRapPro Ormerod, Huxley Duo or Mendel 3 printer or any other printer that uses the Z probe to do X homing, you need to add line M574 X1 S2 to config.g.
+- If you are using a Duet 06 or 085 and you don't already set the P parameter in your G31 command, add P400 to that command to get the same behaviour as before.
+- If you are using PT100 sensors, make sure you don't have any additional parameters in your M305 commands for those heaters left over from when you were using thermistors. In particular, the R parameter now configures the reference resistor value on the PT100 interface board, and must be omitted or set to 400 when using the Duet3D PT100 daughter board.
+
+New features:
+- Implemented M915 motor load monitoring configuration. Only R0 and R1 actions are implemented at present. See https://duet3d.com/wiki/Stall_detection_and_sensorless_homing.
+- Implemented sensorless homing using motor load monitoring (S3 option in M574 command)
+- M574 command has new options S2 to select the Z probe and S3 to select motor load detection, in place of using an endstop switch
+- M584 can now be used to create additional axes using any of the letters UVWABC in any order
+- The value of the reference resistor on MAX31865 PT100 interface boards can now be configured (thanks bpaczkowski)
+- 3-wire PT100 sensors are now supported (thanks zlowred)
+
+Other changes:
+- XYZ options have been removed from the M558 command. Use the new M574 S2 option instead.
+- G31 P parameter now defaults to 500 instead of 400 on the Duet 06/085 build just as it has done in the other builds
+- X homing no longer defaults to using the Z probe in the Duet 06/085 build
+- M906 and M913 commands no longer wait for all movement to stop, so that M913 cdan be used in the power fail script
+
+Bug fixes:
+- Configuring MAX31856 thermocouple boards sometimes resulted in strange behaviour
+- If a filament error was detected, the print was paused and the resume information was saved, but the pause script was not executed and the Duet needed to be restarted before movement was possible again
+
 Version 1.20beta4
 =================
 
