@@ -57,8 +57,9 @@ public:
 	void AddTool(Tool* t);
 	void DeleteTool(Tool* t);
 	void SelectTool(int toolNumber, bool simulating);
-	void StandbyTool(int toolNumber);
+	void StandbyTool(int toolNumber, bool simulating);
 	Tool* GetCurrentTool() const;
+	int GetCurrentToolNumber() const;
 	Tool* GetTool(int toolNumber) const;
 	Tool* GetCurrentOrDefaultTool() const;
 	const Tool* GetFirstTool() const { return toolList; }				// Return the lowest-numbered tool
@@ -84,6 +85,9 @@ public:
 
 #if SUPPORT_IOBITS
  	PortControl& GetPortControl() const;
+#endif
+#if SUPPORT_12864_LCD
+ 	Display& GetDisplay() const;
 #endif
 
 	void Tick();
@@ -133,6 +137,10 @@ private:
  	PortControl *portControl;
 #endif
 
+#if SUPPORT_12864_LCD
+ 	Display *display;
+#endif
+
 	Tool* toolList;								// the tool list is sorted in order of increasing tool number
 	Tool* currentTool;
 	uint32_t lastWarningMillis;					// When we last sent a warning message for things that can happen very often
@@ -157,9 +165,11 @@ private:
 	int beepFrequency, beepDuration;
 	char message[MESSAGE_LENGTH + 1];
 
+	// Message box data
 	bool displayMessageBox;
 	char boxMessage[MESSAGE_LENGTH + 1], boxTitle[MESSAGE_LENGTH + 1];
 	int boxMode;
+	uint32_t boxSeq;
 	uint32_t boxTimer, boxTimeout;
 	AxesBitmap boxControls;
 };
@@ -175,6 +185,10 @@ inline PrintMonitor& RepRap::GetPrintMonitor() const { return *printMonitor; }
 
 #if SUPPORT_IOBITS
 inline PortControl& RepRap::GetPortControl() const { return *portControl; }
+#endif
+
+#if SUPPORT_12864_LCD
+inline Display& RepRap::GetDisplay() const { return *display; }
 #endif
 
 inline bool RepRap::Debug(Module m) const { return debug & (1 << m); }

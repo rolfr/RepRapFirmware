@@ -169,7 +169,7 @@ Licence: GPL
 
 RepRap reprap;
 
-const char *moduleName[] =
+const char * const moduleName[] =
 {
 	"Platform",
 	"Network",
@@ -185,7 +185,7 @@ const char *moduleName[] =
 	"PortControl",
 	"DuetExpansion",
 	"FilamentSensors",
-	"?",
+	"WiFi",
 	"none"
 };
 
@@ -193,7 +193,7 @@ const char *moduleName[] =
 
 // Utilities and storage not part of any class
 
-static char scratchStringBuffer[170];		// this needs to be long enough to print delta parameters and 18 words of stack (162 bytes)
+static char scratchStringBuffer[220];		// this needs to be long enough to print delta parameters and 24 words of stack (217 bytes)
 StringRef scratchString(scratchStringBuffer, ARRAY_SIZE(scratchStringBuffer));
 
 // For debug use
@@ -287,6 +287,19 @@ void SafeStrncat(char *dst, const char *src, size_t length)
 	const size_t index = strlen(dst);
 	strncat(dst + index, src, length - index);
 	dst[length - 1] = 0;
+}
+
+// Append a list of driver numbers to a string, with a space before each one
+void ListDrivers(const StringRef& str, DriversBitmap drivers)
+{
+	for (unsigned int d = 0; drivers != 0; ++d)
+	{
+		if ((drivers & 1) != 0)
+		{
+			scratchString.catf(" %u", d);
+		}
+		drivers >>= 1;
+	}
 }
 
 // End

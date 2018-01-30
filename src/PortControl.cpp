@@ -73,19 +73,19 @@ bool PortControl::Configure(GCodeBuffer& gb, StringRef& reply)
 		seen = true;
 		UpdatePorts(0);
 		numConfiguredPorts = 0;
-		long portNumbers[MaxPorts];
+		uint32_t portNumbers[MaxPorts];
 		size_t numPorts = MaxPorts;
-		gb.GetLongArray(portNumbers, numPorts);
+		gb.GetUnsignedArray(portNumbers, numPorts, false);
 		for (size_t i = 0; i < numPorts; ++i)
 		{
-			long pnum = portNumbers[i];
-			if (pnum < 0 || pnum > HighestLogicalPin)
+			const uint32_t pnum = portNumbers[i];
+			if (pnum > HighestLogicalPin)
 			{
 				reply.printf("Port number %ld out of range", pnum);
 				return true;
 			}
 			IoPort& pm = portMap[i];
-			if (!pm.Set(pnum, PinAccess::write))
+			if (!pm.Set((LogicalPin)pnum, PinAccess::write))
 			{
 				reply.printf("Port number %ld is not available", pnum);
 				return true;

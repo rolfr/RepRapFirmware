@@ -31,7 +31,7 @@ void Logger::Start(time_t time, const StringRef& filename)
 	if (!inLogger)
 	{
 		Lock loggerLock(inLogger);
-		FileStore * const f = reprap.GetPlatform().GetFileStore(SYS_DIR, filename.Pointer(), OpenMode::append);
+		FileStore * const f = reprap.GetPlatform().OpenFile(SYS_DIR, filename.Pointer(), OpenMode::append);
 		if (f != nullptr)
 		{
 			logFile.Set(f);
@@ -111,7 +111,7 @@ void Logger::InternalLogMessage(time_t time, const char *message)
 }
 
 // This is called regularly by Platform to give the logger an opportunity to flush the file buffer
-void Logger::Flush()
+void Logger::Flush(bool forced)
 {
 	if (logFile.IsLive() && dirty && !inLogger)
 	{
@@ -122,7 +122,7 @@ void Logger::Flush()
 		// 2. If it hasn't been flushed for LogFlushInterval milliseconds.
 		const FilePosition currentPos = logFile.GetPosition();
 		const uint32_t now = millis();
-		if (now - lastFlushTime >= LogFlushInterval || currentPos/512 != lastFlushFileSize/512)
+		if (forced || now - lastFlushTime >= LogFlushInterval || currentPos/512 != lastFlushFileSize/512)
 		{
 			Lock loggerLock(inLogger);
 			logFile.Flush();

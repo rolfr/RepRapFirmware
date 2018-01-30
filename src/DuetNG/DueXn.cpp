@@ -8,6 +8,7 @@
 #include "DueXn.h"
 #include "SX1509.h"
 #include "Platform.h"
+#include "RepRap.h"
 
 namespace DuetExpansion
 {
@@ -56,22 +57,24 @@ namespace DuetExpansion
 	// Identify which expansion board (if any) is attached and initialise it
 	ExpansionBoardType DueXnInit()
 	{
-		uint8_t ret = dueXnExpander.begin(DueXnAddress);
-		if (ret != 1)
+		reprap.GetPlatform().InitI2c();					// initialise I2C
+
+		bool ret = dueXnExpander.begin(DueXnAddress);
+		if (!ret)
 		{
 			delay(100);									// wait a little while
 			ret = dueXnExpander.begin(DueXnAddress);	// do 1 retry
 		}
 
-		if (ret != 1)
-		{
-			dueXnBoardType = ExpansionBoardType::none;		// no device found at that address, or a serious error
-		}
-		else
+		if (ret)
 		{
 			dueXnExpander.pinModeMultiple(BoardTypePins, INPUT_PULLUP);
 			const uint16_t data = dueXnExpander.digitalReadAll();
 			dueXnBoardType = boardTypes[(data & BoardTypePins) >> BoardTypeShift];
+		}
+		else
+		{
+			dueXnBoardType = ExpansionBoardType::none;		// no device found at that address, or a serious error
 		}
 
 		if (dueXnBoardType != ExpansionBoardType::none)
@@ -98,14 +101,15 @@ namespace DuetExpansion
 	// Look for an additional output pin expander
 	void AdditionalOutputInit()
 	{
-		uint8_t ret = additionalIoExpander.begin(AdditionalIoExpanderAddress);
-		if (ret != 1)
+		reprap.GetPlatform().InitI2c();										// initialise I2C
+		bool ret = additionalIoExpander.begin(AdditionalIoExpanderAddress);
+		if (!ret)
 		{
 			delay(100);														// wait a little while
 			ret = additionalIoExpander.begin(AdditionalIoExpanderAddress);	// do 1 retry
 		}
 
-		if (ret == 1)
+		if (ret)
 		{
 			additionalIoExpander.pinModeMultiple((1u << 16) - 1, INPUT_PULLDOWN);
 			additionalIoInputBits = additionalIoExpander.digitalReadAll();
@@ -173,7 +177,7 @@ namespace DuetExpansion
 						break;
 					case INPUT_PULLUP:
 					case INPUT_PULLDOWN:
-						mode = INPUT;			// we are using 5rV-tolerant input with external pullup resistors, so don't enable internal pullup/pulldown resistors
+						mode = INPUT;			// we are using 5V-tolerant input with external pullup resistors, so don't enable internal pullup/pulldown resistors
 						break;
 					default:
 						break;

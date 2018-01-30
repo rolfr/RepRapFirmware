@@ -21,13 +21,13 @@
 // Each DDA needs one DM per drive that it moves.
 // However, DM's are large, so we provide fewer than DRIVES * DdaRingLength of them. The planner checks that enough DMs are available before filling in a new DDA.
 
-#if SAM4E || SAM4S
+#if SAM4E || SAM4S || SAME70
 const unsigned int DdaRingLength = 30;
 const unsigned int NumDms = DdaRingLength * 8;						// suitable for e.g. a delta + 5 input hot end
 #else
 // We are more memory-constrained on the SAM3X
 const unsigned int DdaRingLength = 20;
-const unsigned int NumDms = DdaRingLength * 5;						// suitable for e.g. a delta + 1-input hot end
+const unsigned int NumDms = DdaRingLength * 5;						// suitable for e.g. a delta + 2-input hot end
 #endif
 
 /**
@@ -70,6 +70,7 @@ public:
 	float PushBabyStepping(float amount);							// Try to push some babystepping through the lookahead queue
 
 	void Diagnostics(MessageType mtype);							// Report useful stuff
+	void RecordLookaheadError() { ++numLookaheadErrors; }			// Record a lookahead error
 
 	// Kinematics and related functions
 	Kinematics& GetKinematics() const { return *kinematics; }
@@ -99,7 +100,9 @@ public:
 	void PrintCurrentDda() const;													// For debugging
 
 	bool PausePrint(RestorePoint& rp);												// Pause the print as soon as we can, returning true if we were able to
+#if HAS_VOLTAGE_MONITOR
 	bool LowPowerPause(RestorePoint& rp);											// Pause the print immediately, returning true if we were able to
+#endif
 
 	bool NoLiveMovement() const;													// Is a move running, or are there any queued?
 
@@ -115,7 +118,7 @@ public:
 
 	void AdjustLeadscrews(const floatc_t corrections[]);							// Called by some Kinematics classes to adjust the leadscrews
 
-	int32_t GetAccumulatedExtrusion(size_t extruder);								// Return ands reset the accumulated extrusion amount
+	int32_t GetAccumulatedExtrusion(size_t extruder, bool& nonPrinting);			// Return and reset the accumulated extrusion amount
 
 	bool WriteResumeSettings(FileStore *f) const;									// Write settings for resuming the print
 
@@ -157,6 +160,7 @@ private:
 
 	unsigned int numLookaheadUnderruns;					// How many times we have run out of moves to adjust during lookahead
 	unsigned int numPrepareUnderruns;					// How many times we wanted a new move but there were only un-prepared moves in the queue
+	unsigned int numLookaheadErrors;					// How many times our lookahead algorithm failed
 	unsigned int idleCount;								// The number of times Spin was called and had no new moves to process
 	uint32_t longestGcodeWaitInterval;					// the longest we had to wait for a new GCode
 	float simulationTime;								// Print time since we started simulating
@@ -166,6 +170,7 @@ private:
 	volatile bool liveCoordinatesValid;					// True if the XYZ live coordinates are reliable (the extruder ones always are)
 	volatile int32_t liveEndPoints[DRIVES];				// The XYZ endpoints of the last completed move in motor coordinates
 	volatile int32_t extrusionAccumulators[MaxExtruders]; // Accumulated extruder motor steps
+	volatile bool extruderNonPrinting[MaxExtruders];	// Set whenever the extruder starts a non-printing move
 
 	float tangents[3]; 									// Axis compensation - 90 degrees + angle gives angle between axes
 	float& tanXY = tangents[0];

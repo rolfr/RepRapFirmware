@@ -43,7 +43,7 @@ void Move::Init()
 
 	currentDda = nullptr;
 	stepErrors = 0;
-	numLookaheadUnderruns = numPrepareUnderruns = 0;
+	numLookaheadUnderruns = numPrepareUnderruns = numLookaheadErrors = 0;
 
 	// Clear the transforms
 	SetIdentityTransform();
@@ -65,6 +65,7 @@ void Move::Init()
 	for (size_t i = 0; i < MaxExtruders; ++i)
 	{
 		extrusionAccumulators[i] = 0;
+		extruderNonPrinting[i] = false;
 		extrusionPending[i] = 0.0;
 	}
 
@@ -126,7 +127,7 @@ void Move::Spin()
 		{
 			if (reprap.Debug(moduleMove))
 			{
-				ddaRingCheckPointer->DebugPrint();
+				ddaRingCheckPointer->DebugPrintAll();
 			}
 			++stepErrors;
 			reprap.GetPlatform().LogError(ErrorCode::BadMove);
@@ -397,7 +398,9 @@ bool Move::PausePrint(RestorePoint& rp)
 	// So on return we need to signal one of the following to GCodes:
 	// 1. We have skipped some moves in the queue. Pass back the file address of the first move we have skipped, the feed rate at the start of that move
 	//    and the iobits at the start of that move, and return true.
-	// 2. All moves in the queue need to be executed. Also any move held by GCodes needs to be completed it is it not the first segment. Return false.
+	// 2. All moves in the queue need to be executed. Also any move held by GCodes needs to be completed it is it not the first segment.
+	//    Update the restore point with the coordinates and iobits as at the end of the previous move and return false.
+	//    The extruder position, file position and feed rate are not filled in.
 	//
 	// In general, we can pause after a move if it is the last segment and its end speed is slow enough.
 	// We can pause before a move if it is the first segment in that move.
@@ -432,12 +435,7 @@ bool Move::PausePrint(RestorePoint& rp)
 
 	cpu_irq_enable();
 
-	if (ddaRingAddPointer == savedDdaRingAddPointer)
-	{
-		return false;									// we can't skip any moves
-	}
-
-	// We are going to skip some moves. Get the end coordinate of the previous move.
+	// We may be going to skip some moves. Get the end coordinate of the previous move.
 	DDA * const prevDda = ddaRingAddPointer->GetPrevious();
 	const size_t numVisibleAxes = reprap.GetGCodes().GetVisibleAxes();
 	for (size_t axis = 0; axis < numVisibleAxes; ++axis)
@@ -447,14 +445,21 @@ bool Move::PausePrint(RestorePoint& rp)
 
 	InverseAxisAndBedTransform(rp.moveCoords, prevDda->GetXAxes(), prevDda->GetYAxes());	// we assume that xAxes hasn't changed between the moves
 
-	dda = ddaRingAddPointer;
-	rp.feedRate = dda->GetRequestedSpeed();
-	rp.virtualExtruderPosition = dda->GetVirtualExtruderPosition();
-	rp.filePos = dda->GetFilePosition();
+	rp.proportionDone = ddaRingAddPointer->GetProportionDone(false);	// get the proportion of the current multi-segment move that has been completed
 
 #if SUPPORT_IOBITS
 	rp.ioBits = dda->GetIoBits();
 #endif
+
+	if (ddaRingAddPointer == savedDdaRingAddPointer)
+	{
+		return false;									// we can't skip any moves
+	}
+
+	dda = ddaRingAddPointer;
+	rp.feedRate = dda->GetRequestedSpeed();
+	rp.virtualExtruderPosition = dda->GetVirtualExtruderPosition();
+	rp.filePos = dda->GetFilePosition();
 
 	// Free the DDAs for the moves we are going to skip
 	do
@@ -467,6 +472,8 @@ bool Move::PausePrint(RestorePoint& rp)
 
 	return true;
 }
+
+#if HAS_VOLTAGE_MONITOR
 
 // Pause the print immediately, returning true if we were able to skip or abort any moves and setting up to the move we aborted
 bool Move::LowPowerPause(RestorePoint& rp)
@@ -514,7 +521,7 @@ bool Move::LowPowerPause(RestorePoint& rp)
 	rp.feedRate = dda->GetRequestedSpeed();
 	rp.virtualExtruderPosition = dda->GetVirtualExtruderPosition();
 	rp.filePos = dda->GetFilePosition();
-	rp.proportionDone = dda->GetProportionDone();		// store how much of the complete multi-segment move's extrusion has been done
+	rp.proportionDone = dda->GetProportionDone(abortedMove);	// store how much of the complete multi-segment move's extrusion has been done
 
 #if SUPPORT_IOBITS
 	rp.ioBits = dda->GetIoBits();
@@ -542,6 +549,8 @@ bool Move::LowPowerPause(RestorePoint& rp)
 	return true;
 }
 
+#endif
+
 #if 0
 // For debugging
 extern uint32_t sqSum1, sqSum2, sqCount, sqErrors, lastRes1, lastRes2;
@@ -552,10 +561,10 @@ void Move::Diagnostics(MessageType mtype)
 {
 	Platform& p = reprap.GetPlatform();
 	p.Message(mtype, "=== Move ===\n");
-	p.MessageF(mtype, "MaxReps: %" PRIu32 ", StepErrors: %u, FreeDm: %d, MinFreeDm %d, MaxWait: %" PRIu32 "ms, Underruns: %u, %u\n",
-						DDA::maxReps, stepErrors, DriveMovement::NumFree(), DriveMovement::MinFree(), longestGcodeWaitInterval, numLookaheadUnderruns, numPrepareUnderruns);
+	p.MessageF(mtype, "MaxReps: %" PRIu32 ", StepErrors: %u, LaErrors: %u, FreeDm: %d, MinFreeDm %d, MaxWait: %" PRIu32 "ms, Underruns: %u, %u\n",
+						DDA::maxReps, stepErrors, numLookaheadErrors, DriveMovement::NumFree(), DriveMovement::MinFree(), longestGcodeWaitInterval, numLookaheadUnderruns, numPrepareUnderruns);
 	DDA::maxReps = 0;
-	numLookaheadUnderruns = numPrepareUnderruns = 0;
+	numLookaheadUnderruns = numPrepareUnderruns = numLookaheadErrors = 0;
 	longestGcodeWaitInterval = 0;
 	DriveMovement::ResetMinFree();
 
@@ -960,6 +969,10 @@ void Move::CurrentMoveCompleted()
 	for (size_t drive = numAxes; drive < DRIVES; ++drive)
 	{
 		extrusionAccumulators[drive - numAxes] += currentDda->GetStepsTaken(drive);
+		if (currentDda->IsNonPrintingExtruderMove(drive))
+		{
+			extruderNonPrinting[drive - numAxes] = true;
+		}
 	}
 	currentDda = nullptr;
 
@@ -1088,7 +1101,9 @@ void Move::ResetExtruderPositions()
 }
 
 // Get the accumulated extruder motor steps taken by an extruder since the last call. Used by the filament monitoring code.
-int32_t Move::GetAccumulatedExtrusion(size_t extruder)
+// Returns the number of motor steps moves since the last call, and nonPrinting is true if we are currently executing an extruding but non-printing move
+// or we completed one since the last call.
+int32_t Move::GetAccumulatedExtrusion(size_t extruder, bool& nonPrinting)
 {
 	const size_t drive = extruder + reprap.GetGCodes().GetTotalAxes();
 	if (drive < DRIVES)
@@ -1096,12 +1111,27 @@ int32_t Move::GetAccumulatedExtrusion(size_t extruder)
 		const irqflags_t flags = cpu_irq_save();
 		const int32_t ret = extrusionAccumulators[extruder];
 		const DDA * const cdda = currentDda;						// capture volatile variable
-		const int32_t adjustment = (cdda != nullptr) ? cdda->GetStepsTaken(drive) : 0;
+		const int32_t adjustment = (cdda == nullptr) ? 0 : cdda->GetStepsTaken(drive);
+		if (adjustment == 0)
+		{
+			// Either there is no current move, or we are at the very start of this move, or it doesn't involve this extruder e.g. a travel move
+			nonPrinting = extruderNonPrinting[extruder];
+		}
+		else if (cdda->IsPrintingMove())
+		{
+			nonPrinting = extruderNonPrinting[extruder];
+			extruderNonPrinting[extruder] = false;
+		}
+		else
+		{
+			nonPrinting = true;
+		}
 		extrusionAccumulators[extruder] = -adjustment;
 		cpu_irq_restore(flags);
 		return ret + adjustment;
 	}
 
+	nonPrinting = true;
 	return 0.0;
 }
 
@@ -1196,7 +1226,7 @@ void Move::PrintCurrentDda() const
 {
 	if (currentDda != nullptr)
 	{
-		currentDda->DebugPrint();
+		currentDda->DebugPrintAll();
 	}
 }
 
